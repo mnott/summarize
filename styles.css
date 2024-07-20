@@ -1,0 +1,35 @@
+.heading1 {
+    font-size: 14px;
+    line-height: 18px;
+    margin-bottom: 12px;
+    color: #FFFFFF;
+    background-color: #144D6E;
+    text-transform: uppercase;
+    padding: 15px;
+    width: 100%;
+}
+
+
+.heading2 {
+    font-size: 12px;
+    line-height: 18px;
+    color: #000000;
+    background-color: #B5DEF2;
+    text-transform: uppercase;
+    padding: 2px;
+    width: 100%;
+}
+
+
+.bullet {
+    margin-left: 20px;
+    text-indent: -10px;
+    margin-bottom: 6px;
+}
+
+.bodytext {
+    font-size: 12px;
+    line-height: 15px;
+    margin-bottom: 12px;
+    text-align: justify;
+}
