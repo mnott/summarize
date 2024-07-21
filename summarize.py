@@ -256,7 +256,7 @@ def convert_images_to_pdf(image_paths, output_path, padding_ratio=0.02):
 
 def apply_ocr(pdf_path):
     """
-    Apply Optical Character Recognition (OCR) to a PDF file.
+    Apply Optical Character Recognition (OCR) to a PDF file and place text behind the image.
 
     Args:
         pdf_path (str): Path to the input PDF file.
@@ -264,24 +264,56 @@ def apply_ocr(pdf_path):
     Returns:
         str: Extracted text from the PDF.
     """
-    with SuppressOutput():
-        images = convert_from_path(pdf_path)
-
-    writer = PdfWriter()
-    extracted_text = ""
-
-    for image in images:
+    try:
         with SuppressOutput():
-            text = pytesseract.image_to_string(image)
-            extracted_text += text + "\n"
-            pdf_bytes = pytesseract.image_to_pdf_or_hocr(image, extension='pdf')
-        new_pdf = PdfReader(io.BytesIO(pdf_bytes))
-        writer.add_page(new_pdf.pages[0])
+            images = convert_from_path(pdf_path)
 
-    with open(pdf_path, 'wb') as f:
-        writer.write(f)
+        extracted_text = ""
+        doc = fitz.open()
 
-    return extracted_text
+        for image in images:
+            # Perform OCR
+            ocr_result = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+
+            # Create a new page in the PDF
+            img_bytes = io.BytesIO()
+            image.save(img_bytes, format='JPEG', quality=100)
+            img_bytes.seek(0)
+            pix = fitz.Pixmap(img_bytes)
+            page = doc.new_page(width=pix.width, height=pix.height)
+
+            # Add the image to the page
+            page.insert_image(fitz.Rect(0, 0, pix.width, pix.height), pixmap=pix)
+
+            # Add invisible text behind the image
+            confidence_threshold = 60
+            for j in range(len(ocr_result['text'])):
+                if ocr_result['text'][j].strip() and int(ocr_result['conf'][j]) > confidence_threshold:
+                    x, y, w, h = ocr_result['left'][j], ocr_result['top'][j], ocr_result['width'][j], ocr_result['height'][j]
+                    text = ocr_result['text'][j]
+                    extracted_text += text + " "
+
+                    try:
+                        # Create an invisible text layer
+                        page.insert_textbox(
+                            fitz.Rect(x, y, x+w, y+h),
+                            text,
+                            fontname="helv",
+                            fontsize=h,
+                            color=(0, 0, 0, 0)  # Transparent color
+                        )
+                    except Exception:
+                        pass  # Silently ignore text insertion errors
+
+        # Save the PDF with compression
+        doc.save(pdf_path, deflate=True)
+        doc.close()
+
+        return extracted_text.strip()
+
+    except Exception as e:
+        print(f"Error in apply_ocr: {str(e)}")
+        return ""
 
 
 def are_images_similar(img1_path, img2_path, threshold=0.90):
