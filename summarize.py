@@ -612,10 +612,10 @@ def create_summary_pdf(summary, output_path, css_path):
 
 @app.command()
 def summarize(
-    input_files:  List[str] = typer.Argument(None,                              help="Paths to input files (PDFs or images)"),
-    output_file:        str = typer.Option("output.pdf", "-o", "--output-file", help="Path to the output summary PDF file"),
-    css_file: Optional[str] = typer.Option(None,         "-c", "--css-file",    help="Path to the CSS file for styling"),
-    max_tokens:         int = typer.Option(1000,         "-m", "--max-tokens",  help="Maximum number of tokens for summary generation", show_default=True)
+    input_files:     List[str] = typer.Argument(None,                               help="Paths to input files (PDFs or images)"),
+    output_file:           str = typer.Option("summary.pdf", "-o", "--output-file", help="Path to the output summary PDF file"),
+    css_file:    Optional[str] = typer.Option(None,          "-c", "--css-file",    help="Path to the CSS file for styling"),
+    max_tokens:            int = typer.Option(1000,          "-m", "--max-tokens",  help="Maximum number of tokens for summary generation", show_default=True)
 ):
     """
     Generate a summary PDF from input files (PDFs or images).
@@ -637,7 +637,6 @@ def summarize(
     if css_file is None:
         script_dir = os.path.dirname(os.path.realpath(__file__))
         css_file = os.path.join(script_dir, "styles.css")
-        # console.print(f"[blue]Using default CSS file: {css_file}[/blue]")
 
     pdf_files = [f for f in input_files if f.lower().endswith('.pdf')]
     image_files = [f for f in input_files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
@@ -708,10 +707,15 @@ def summarize(
                 summary_pdf_path = os.path.join(temp_dir, "summary.pdf")
                 create_summary_pdf(summary, summary_pdf_path, css_file)
 
-                first_file_creation_time = datetime.fromtimestamp(os.path.getctime(input_files[0]))
-                date_str = first_file_creation_time.strftime("%Y-%m-%d")
+                # Get the modification time of the first file used
+                if filtered_files:
+                    first_file_modification_time = datetime.fromtimestamp(os.path.getmtime(filtered_files[0]))
+                else:
+                    first_file_modification_time = datetime.now()  # Fallback to current time if no files are sorted
+
+                date_time_str = first_file_modification_time.strftime("%Y%m%d_%H%M")
                 output_base_name = os.path.splitext(output_file)[0]
-                final_output_filename = f"summary_{date_str}_{output_base_name}.pdf"
+                final_output_filename = f"{output_base_name}_{date_time_str}.pdf"
                 final_output_path = os.path.abspath(final_output_filename)
 
                 final_merger = PdfMerger()
