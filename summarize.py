@@ -103,7 +103,7 @@ from InquirerPy import inquirer
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
 from pdf2image import convert_from_path
-from PIL import Image, ImageChops, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageChops, UnidentifiedImageError
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter
 from reportlab.lib import colors
 from reportlab.lib.colors import HexColor, Color, black, white
@@ -254,6 +254,17 @@ def convert_images_to_pdf(image_paths, output_path, padding_ratio=0.02):
     c.save()
 
 
+def improve_image(image):
+    # Increase contrast
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(1.5)
+
+    # Increase sharpness
+    enhancer = ImageEnhance.Sharpness(image)
+    image = enhancer.enhance(1.5)
+
+    return image
+
 def apply_ocr(pdf_path):
     """
     Apply Optical Character Recognition (OCR) to a PDF file and place text behind the image.
@@ -272,8 +283,11 @@ def apply_ocr(pdf_path):
         doc = fitz.open()
 
         for image in images:
-            # Perform OCR
-            ocr_result = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+            # Improve image quality
+            image = improve_image(image)
+
+            # Perform OCR with multiple languages
+            ocr_result = pytesseract.image_to_data(image, lang='eng+pol+deu+fra+spa', output_type=pytesseract.Output.DICT)
 
             # Create a new page in the PDF
             img_bytes = io.BytesIO()
@@ -304,6 +318,8 @@ def apply_ocr(pdf_path):
                         )
                     except Exception:
                         pass  # Silently ignore text insertion errors
+
+            extracted_text += "\n"
 
         # Save the PDF with compression
         doc.save(pdf_path, deflate=True)
