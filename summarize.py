@@ -183,71 +183,68 @@ def sort_by_creation_time(files):
     return sorted(files, key=lambda x: os.path.getctime(x))
 
 
-def crop_image(image_path):
+def crop_image(image_path, padding=10):
     """
-    Crop an image to remove any surrounding whitespace.
+    Crop an image to remove any surrounding whitespace and add padding for print borders.
 
     Args:
         image_path (str): Path to the image file.
+        padding (int): Amount of padding to add around the cropped area. Default is 10 pixels.
 
     Returns:
-        PIL.Image.Image: Cropped image.
+        PIL.Image.Image: Cropped image with padding.
     """
     img = Image.open(image_path)
     bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
     diff = ImageChops.difference(img, bg)
     diff = ImageChops.add(diff, diff, 2.0, -100)
     bbox = diff.getbbox()
-    return img.crop(bbox) if bbox else img
+
+    if bbox:
+        left, upper, right, lower = bbox
+        cropped_img = img.crop((left, upper, right, lower))
+
+        # Create a new image with horizontal padding
+        padded_img = Image.new(img.mode, (cropped_img.width + 2 * padding, cropped_img.height), img.getpixel((0, 0)))
+        padded_img.paste(cropped_img, (padding, 0))
+        return padded_img
+    else:
+        return img
 
 
-def get_max_width(image_paths):
+def convert_images_to_pdf(image_paths, output_path, padding_ratio=0.02):
     """
-    Get the maximum width among a list of images.
-
-    Args:
-        image_paths (List[str]): List of image file paths.
-
-    Returns:
-        int: Maximum width.
-    """
-    max_width = 0
-    for image_path in image_paths:
-        img = crop_image(image_path)
-        max_width = max(max_width, img.width)
-    return max_width
-
-
-def convert_images_to_pdf(image_paths, output_path):
-    """
-    Convert a list of images to a single PDF file.
+    Convert a list of images to a single PDF file with proportional padding and maintained quality.
 
     Args:
         image_paths (List[str]): List of image file paths.
         output_path (str): Path to save the output PDF.
+        padding_ratio (float): Ratio of padding to add around the cropped area of each image relative to the page width. Default is 0.05 (5% of the page width).
     """
     page_width, page_height = landscape(A4)
+    padding = int(page_width * padding_ratio)  # Calculate padding based on page width
     c = canvas.Canvas(output_path, pagesize=(page_width, page_height))
 
     for image_path in image_paths:
-        img = crop_image(image_path)
+        img = crop_image(image_path, padding)
         img_width, img_height = img.size
 
-        x_position = (page_width - img_width) / 2
-        y_position = (page_height - img_height) / 2
+        # Calculate scaling factor to fit the image within the page with padding
+        max_width = page_width - 2 * padding
+        max_height = page_height #  - 2 * padding
+        scale = min(max_width / img_width, max_height / img_height)
 
-        if img_width > page_width or img_height > page_height:
-            scale = min(page_width / img_width, page_height / img_height)
-            img_width *= scale
-            img_height *= scale
-            x_position = (page_width - img_width) / 2
-            y_position = (page_height - img_height) / 2
+        scaled_width = int(img_width * scale)
+        scaled_height = int(img_height * scale)
+
+        x_position = (page_width - scaled_width) / 2
+        y_position = (page_height - scaled_height) / 2
 
         img_buffer = io.BytesIO()
         img.save(img_buffer, format='PNG')
         img_buffer.seek(0)
 
-        c.drawImage(ImageReader(img_buffer), x_position, y_position, width=img_width, height=img_height)
+        c.drawImage(ImageReader(img_buffer), x_position, y_position, width=scaled_width, height=scaled_height)
         c.showPage()
 
     c.save()
