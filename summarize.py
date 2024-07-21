@@ -694,7 +694,7 @@ def summarize(
                 # Filter similar images with progress update
                 filter_task = progress.add_task("[blue]Filtering  images...", total=len(sorted_files))
                 filtered_files = filter_similar_images(sorted_files, num_workers=multiprocessing.cpu_count(), progress=progress, filter_task=filter_task)
-                progress.update(filter_task, advance=len(sorted_files) - len(filtered_files))
+                progress.update(filter_task, completed=len(sorted_files))
 
                 image_task = progress.add_task("[blue]Processing images...", total=len(filtered_files))
                 with tempfile.TemporaryDirectory() as temp_dir:
