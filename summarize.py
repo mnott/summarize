@@ -284,7 +284,7 @@ def apply_ocr(pdf_path):
     return extracted_text
 
 
-def are_images_similar(img1_path, img2_path, threshold=0.95):
+def are_images_similar(img1_path, img2_path, threshold=0.90):
     """
     Check if two images are similar using structural similarity index.
 
@@ -447,6 +447,12 @@ def generate_summary(text, max_tokens=1000):
 
     You don't need to specially mention things like "Multilingual elements
     suggesting the document may be available in multiple languages".
+
+    If you see a Microsoft Teams or other video conferincing app window in the
+    screenshots, you do not need to describe that interface. You can assume the
+    reader knows what it looks like. I absolutely do not want you to give a
+    description of the teams interface. so no "Meeting controls (e.g., Leave, Take control, Chat, Raise hand)"
+    etc. Just focus on the content of the document.
 
     Here's the text to summarize:
 
