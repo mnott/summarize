@@ -407,10 +407,18 @@ def generate_summary(text, max_tokens=1000):
     # Main Topics:
 
     ## [Topic 1]:
+
+    [Your Summary of Topic 1: you can be quite a bit more detailed here and use
+    multiple sentences if necessary and give context]
+
     - [Explanation point 1]
     - [Explanation point 2]
 
     ## [Topic 2]:
+
+    [Your Summary of Topic 2: you can be quite a bit more detailed here and use
+    multiple sentences if necessary and give context]
+
     - [Explanation point 1]
     - [Explanation point 2]
 
@@ -418,6 +426,9 @@ def generate_summary(text, max_tokens=1000):
 
     Important: Start your response directly with the summary. Do not use
     any introductory phrases like "Sure," "Here's," or "Certainly."
+
+    You don't need to specially mention things like "Multilingual elements
+    suggesting the document may be available in multiple languages".
 
     Here's the text to summarize:
 
