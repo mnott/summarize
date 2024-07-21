@@ -80,6 +80,7 @@ import logging
 import multiprocessing
 import os
 import re
+import shutil
 import sys
 import tempfile
 import warnings
@@ -97,6 +98,7 @@ import nltk
 import numpy as np
 import pytesseract
 import spacy
+import traceback
 import typer
 from bs4 import BeautifulSoup
 from InquirerPy import inquirer
@@ -199,6 +201,8 @@ def crop_image(image_path, padding=10):
         PIL.Image.Image: Cropped image with padding.
     """
     img = Image.open(image_path)
+    if img.mode == 'RGBA':
+        img = img.convert('RGB')
     bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
     diff = ImageChops.difference(img, bg)
     diff = ImageChops.add(diff, diff, 2.0, -100)
@@ -217,25 +221,16 @@ def crop_image(image_path, padding=10):
 
 
 def convert_images_to_pdf(image_paths, output_path, padding_ratio=0.02):
-    """
-    Convert a list of images to a single PDF file with proportional padding and maintained quality.
-
-    Args:
-        image_paths (List[str]): List of image file paths.
-        output_path (str): Path to save the output PDF.
-        padding_ratio (float): Ratio of padding to add around the cropped area of each image relative to the page width. Default is 0.05 (5% of the page width).
-    """
     page_width, page_height = landscape(A4)
-    padding = int(page_width * padding_ratio)  # Calculate padding based on page width
+    padding = int(page_width * padding_ratio)
     c = canvas.Canvas(output_path, pagesize=(page_width, page_height))
 
     for image_path in image_paths:
         img = crop_image(image_path, padding)
         img_width, img_height = img.size
 
-        # Calculate scaling factor to fit the image within the page with padding
         max_width = page_width - 2 * padding
-        max_height = page_height #  - 2 * padding
+        max_height = page_height
         scale = min(max_width / img_width, max_height / img_height)
 
         scaled_width = int(img_width * scale)
@@ -245,7 +240,60 @@ def convert_images_to_pdf(image_paths, output_path, padding_ratio=0.02):
         y_position = (page_height - scaled_height) / 2
 
         img_buffer = io.BytesIO()
-        img.save(img_buffer, format='PNG')
+        # img.save(img_buffer, format='JPEG', quality=85, optimize=True)
+        img.save(img_buffer, format='PNG', quality=100, optimize=True)
+        img_buffer.seek(0)
+
+        c.drawImage(ImageReader(img_buffer), x_position, y_position, width=scaled_width, height=scaled_height)
+        c.showPage()
+
+    c.save()
+
+
+def compress_pdf(input_path, output_path):
+    reader = PdfReader(input_path)
+    writer = PdfWriter()
+
+    for page in reader.pages:
+        page.compress_content_streams()  # This is CPU intensive!
+        writer.add_page(page)
+
+    for key, value in reader.metadata.items():
+        writer.add_metadata({key: value})
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+
+def convert_images_to_pdf(image_paths, output_path, padding_ratio=0.02):
+    page_width, page_height = landscape(A4)
+    padding = int(page_width * padding_ratio)
+    c = canvas.Canvas(output_path, pagesize=(page_width, page_height))
+    c.setPageCompression(1)  # Enable compression
+
+    for image_path in image_paths:
+        img = crop_image(image_path, padding)
+        img_width, img_height = img.size
+
+        max_width = page_width - 2 * padding
+        max_height = page_height
+        scale = min(max_width / img_width, max_height / img_height)
+
+        scaled_width = int(img_width * scale)
+        scaled_height = int(img_height * scale)
+
+        x_position = (page_width - scaled_width) / 2
+        y_position = (page_height - scaled_height) / 2
+
+        img_buffer = io.BytesIO()
+        # Convert RGBA to RGB before saving as JPEG
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+
+        # Note: JPEG compression is lossy, so use PNG for better quality
+        # This here makes all the difference.
+        # img.save(img_buffer, format='JPEG', quality=85, optimize=True)
+        img.save(img_buffer, format='PNG', quality=100, optimize=True)
         img_buffer.seek(0)
 
         c.drawImage(ImageReader(img_buffer), x_position, y_position, width=scaled_width, height=scaled_height)
@@ -265,16 +313,8 @@ def improve_image(image):
 
     return image
 
+
 def apply_ocr(pdf_path):
-    """
-    Apply Optical Character Recognition (OCR) to a PDF file and place text behind the image.
-
-    Args:
-        pdf_path (str): Path to the input PDF file.
-
-    Returns:
-        str: Extracted text from the PDF.
-    """
     try:
         with SuppressOutput():
             images = convert_from_path(pdf_path)
@@ -283,23 +323,18 @@ def apply_ocr(pdf_path):
         doc = fitz.open()
 
         for image in images:
-            # Improve image quality
             image = improve_image(image)
 
-            # Perform OCR with multiple languages
             ocr_result = pytesseract.image_to_data(image, lang='eng+pol+deu+fra+spa', output_type=pytesseract.Output.DICT)
 
-            # Create a new page in the PDF
             img_bytes = io.BytesIO()
-            image.save(img_bytes, format='JPEG', quality=100)
+            image.save(img_bytes, format='PNG', quality=100, optimize=True)  # Use JPEG with lower quality
             img_bytes.seek(0)
             pix = fitz.Pixmap(img_bytes)
             page = doc.new_page(width=pix.width, height=pix.height)
 
-            # Add the image to the page
             page.insert_image(fitz.Rect(0, 0, pix.width, pix.height), pixmap=pix)
 
-            # Add invisible text behind the image
             confidence_threshold = 60
             for j in range(len(ocr_result['text'])):
                 if ocr_result['text'][j].strip() and int(ocr_result['conf'][j]) > confidence_threshold:
@@ -308,21 +343,19 @@ def apply_ocr(pdf_path):
                     extracted_text += text + " "
 
                     try:
-                        # Create an invisible text layer
                         page.insert_textbox(
                             fitz.Rect(x, y, x+w, y+h),
                             text,
                             fontname="helv",
                             fontsize=h,
-                            color=(0, 0, 0, 0)  # Transparent color
+                            color=(0, 0, 0, 0)
                         )
                     except Exception:
-                        pass  # Silently ignore text insertion errors
+                        pass
 
             extracted_text += "\n"
 
-        # Save the PDF with compression
-        doc.save(pdf_path, deflate=True)
+        doc.save(pdf_path, deflate=True, garbage=4, clean=True)  # Use more aggressive compression
         doc.close()
 
         return extracted_text.strip()
@@ -392,17 +425,22 @@ def process_image(args):
     Process a single image file.
 
     Args:
-        args (tuple): Tuple containing (png_file, temp_dir, i).
+        args (tuple): Tuple containing (png_file, temp_dir, i, use_original_resolution).
 
     Returns:
         tuple: (pdf_path, extracted_text)
     """
     png_file, temp_dir, i = args
     pdf_path = os.path.join(temp_dir, f"temp_{i}.pdf")
-    with SuppressOutput():
-        convert_images_to_pdf([png_file], pdf_path)
-        extracted_text = apply_ocr(pdf_path)
-    return pdf_path, extracted_text
+    try:
+        with SuppressOutput():
+            convert_images_to_pdf([png_file], pdf_path)  # Make sure this line is correct
+            extracted_text = apply_ocr(pdf_path)
+        return pdf_path, extracted_text
+    except Exception as e:
+        console.print(f"[red]Error processing image {png_file}: {str(e)}[/red]")
+        console.print(f"[yellow]Stack trace:[/yellow]\n{traceback.format_exc()}")
+        return None, None
 
 
 def clean_text(text):
@@ -696,10 +734,12 @@ def create_summary_pdf(summary, output_path, css_path):
 
 @app.command()
 def summarize(
-    input_files:     List[str] = typer.Argument(None,                               help="Paths to input files (PDFs or images)"),
-    output_file:           str = typer.Option("summary.pdf", "-o", "--output-file", help="Path to the output summary PDF file"),
-    css_file:    Optional[str] = typer.Option(None,          "-c", "--css-file",    help="Path to the CSS file for styling"),
-    max_tokens:            int = typer.Option(1000,          "-m", "--max-tokens",  help="Maximum number of tokens for summary generation", show_default=True)
+    input_files:      List[str] = typer.Argument(None,                               help="Paths to input files (PDFs or images)"),
+    output_file:            str = typer.Option("summary.pdf", "-o", "--output-file", help="Path to the output summary PDF file"),
+    css_file:     Optional[str] = typer.Option(None,          "-c", "--css-file",    help="Path to the CSS file for styling"),
+    max_tokens:             int = typer.Option(1000,          "-m", "--max-tokens",  help="Maximum number of tokens for summary generation", show_default=True),
+    similarity_threshold: float = typer.Option(0.95,          "-s", "--similarity",  help="Threshold for image similarity (0-1). Use 1 for no similarity check.", show_default=True),
+    no_ai:                 bool = typer.Option(False,         "-n", "--no-ai",       help="Skip AI recognition and summary generation"),
 ):
     """
     Generate a summary PDF from input files (PDFs or images).
@@ -747,29 +787,37 @@ def summarize(
 
                 sorted_files = sort_by_directory_order(valid_images)
 
-                # Filter similar images with progress update
-                filter_task = progress.add_task("[blue]Filtering  images...", total=len(sorted_files))
-                filtered_files = filter_similar_images(sorted_files, num_workers=multiprocessing.cpu_count(), progress=progress, filter_task=filter_task)
-                progress.update(filter_task, completed=len(sorted_files))
+                # Skip similarity check if threshold is 1
+                if similarity_threshold == 1:
+                    filtered_files = sorted_files
+                    console.print("[blue]Skipping image similarity check as threshold is set to 1.[/blue]")
+                else:
+                    # Filter similar images with progress update
+                    filter_task = progress.add_task("[blue]Filtering images...", total=len(sorted_files))
+                    filtered_files = filter_similar_images(sorted_files, threshold=similarity_threshold, num_workers=multiprocessing.cpu_count(), progress=progress, filter_task=filter_task)
+                    progress.update(filter_task, completed=len(sorted_files))
 
                 image_task = progress.add_task("[blue]Processing images...", total=len(filtered_files))
+
                 with tempfile.TemporaryDirectory() as temp_dir:
                     num_cores = multiprocessing.cpu_count()
                     with ProcessPoolExecutor(max_workers=num_cores) as executor:
                         futures = {executor.submit(process_image, (png, temp_dir, i)): i for i, png in enumerate(filtered_files)}
-                        results = [None] * len(filtered_files)
+                        results = []
                         for future in as_completed(futures):
                             try:
                                 i = futures[future]
-                                results[i] = future.result()
+                                pdf_path, extracted_text = future.result()
+                                if pdf_path and extracted_text:
+                                    results.append((pdf_path, extracted_text))
                                 progress.advance(image_task)
                             except Exception as e:
                                 console.print(f"[red]Error processing image: {e}[/red]")
+                                console.print(f"[yellow]Stack trace:[/yellow]\n{traceback.format_exc()}")
 
                     for pdf_path, extracted_text in results:
-                        if pdf_path and extracted_text:
-                            merger.append(pdf_path)
-                            all_text += extracted_text + "\n"
+                        merger.append(pdf_path)
+                        all_text += extracted_text + "\n"
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_output_file:
                 temp_output_pdf_path = temp_output_file.name
@@ -779,44 +827,59 @@ def summarize(
 
         except Exception as e:
             console.print(f"[red]Error creating the final PDF: {str(e)}[/red]")
+            console.print(f"[yellow]Stack trace:[/yellow]\n{traceback.format_exc()}")
             return
 
         progress.stop()
 
-        summary = generate_summary(all_text, max_tokens)
+        # Generate final output filename
+        first_file_modification_time = datetime.fromtimestamp(os.path.getmtime(filtered_files[0])) if filtered_files else datetime.now()
+        date_time_str = first_file_modification_time.strftime("%Y%m%d_%H%M")
+        output_base_name = os.path.splitext(output_file)[0]
+        final_output_filename = f"{output_base_name}_{date_time_str}.pdf"
+        final_output_path = os.path.abspath(final_output_filename)
 
-        if summary is None:
-            console.print("[red]Failed to generate summary. Please check your AI configuration and try again.[/red]")
-            return
+        if not no_ai:
+            summary = generate_summary(all_text, max_tokens)
 
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                summary_pdf_path = os.path.join(temp_dir, "summary.pdf")
-                create_summary_pdf(summary, summary_pdf_path, css_file)
+            if summary is None:
+                console.print("[red]Failed to generate summary. Please check your AI configuration and try again.[/red]")
+                return
 
-                # Get the modification time of the first file used
-                if filtered_files:
-                    first_file_modification_time = datetime.fromtimestamp(os.path.getmtime(filtered_files[0]))
-                else:
-                    first_file_modification_time = datetime.now()  # Fallback to current time if no files are sorted
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    summary_pdf_path = os.path.join(temp_dir, "summary.pdf")
+                    create_summary_pdf(summary, summary_pdf_path, css_file)
 
-                date_time_str = first_file_modification_time.strftime("%Y%m%d_%H%M")
-                output_base_name = os.path.splitext(output_file)[0]
-                final_output_filename = f"{output_base_name}_{date_time_str}.pdf"
-                final_output_path = os.path.abspath(final_output_filename)
+                    final_merger = PdfMerger()
+                    final_merger.append(summary_pdf_path)
+                    final_merger.append(temp_output_pdf_path)
 
-                final_merger = PdfMerger()
-                final_merger.append(summary_pdf_path)
-                final_merger.append(temp_output_pdf_path)
+                    with open(final_output_path, "wb") as f:
+                        final_merger.write(f)
+                    final_merger.close()
 
-                final_merger.write(final_output_path)
-                final_merger.close()
-                console.print(f"[green]Summary PDF created at {final_output_path}[/green]")
-        except Exception as e:
-            console.print(f"[red]Error creating summary PDF: {str(e)}[/red]")
-        finally:
-            if 'temp_output_pdf_path' in locals() and os.path.exists(temp_output_pdf_path):
-                os.remove(temp_output_pdf_path)
+                    # Compress the final PDF
+                    compress_pdf(final_output_path, final_output_path)
+
+                    console.print(f"[green]Compressed summary PDF created at {final_output_path}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error creating summary PDF: {str(e)}[/red]")
+                console.print(f"[yellow]Stack trace:[/yellow]\n{traceback.format_exc()}")
+            finally:
+                if os.path.exists(temp_output_pdf_path):
+                    os.remove(temp_output_pdf_path)
+        else:
+            try:
+                shutil.move(temp_output_pdf_path, final_output_path)
+
+                # Compress the PDF even if no AI summary is generated
+                compress_pdf(final_output_path, final_output_path)
+
+                console.print(f"[green]Compressed PDF created without AI summary at {final_output_path}[/green]")
+            except Exception as e:
+                console.print(f"[red]Error moving or compressing the PDF file: {str(e)}[/red]")
+                console.print(f"[yellow]Stack trace:[/yellow]\n{traceback.format_exc()}")
 
 
 @app.command()
