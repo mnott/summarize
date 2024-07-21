@@ -170,9 +170,9 @@ with SuppressOutput():
     nltk.download('stopwords', quiet=True)
 
 
-def sort_by_creation_time(files):
+def sort_by_directory_order(files):
     """
-    Sort files by their creation time.
+    Sort files to match the exact order shown in the directory listing.
 
     Args:
         files (List[str]): List of file paths.
@@ -180,7 +180,11 @@ def sort_by_creation_time(files):
     Returns:
         List[str]: Sorted list of file paths.
     """
-    return sorted(files, key=lambda x: os.path.getctime(x))
+    # Get the full path of each file
+    full_paths = [os.path.abspath(f) for f in files]
+
+    # Sort based on the order in which files appear in the directory
+    return sorted(full_paths, key=lambda x: os.path.getmtime(x))
 
 
 def crop_image(image_path, padding=10):
@@ -651,12 +655,9 @@ def summarize(
     console.print("[blue]Starting summarize command...[/blue]")
 
     if input_files is None or len(input_files) == 0:
-        console.print("[blue]No input files provided. Using all PNG, JPG, and JPEG files in the current directory.[/blue]")
-        input_files = glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg")
-
-    if not input_files:
-        console.print("[red]No input files found.[/red]")
-        return
+        console.print("[blue]No input files provided. Using all PNG, JPG, and JPEG files in the current directory, sorted to match directory listing.[/blue]")
+        all_files = glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg")
+        input_files = sort_by_directory_order(all_files)
 
     # Use default CSS file if no CSS file is provided
     if css_file is None:
@@ -689,7 +690,7 @@ def summarize(
                     except UnidentifiedImageError:
                         console.print(f"[red]Skipping invalid image file: {image}[/red]")
 
-                sorted_files = sort_by_creation_time(valid_images)
+                sorted_files = sort_by_directory_order(valid_images)
 
                 # Filter similar images with progress update
                 filter_task = progress.add_task("[blue]Filtering  images...", total=len(sorted_files))
@@ -700,15 +701,20 @@ def summarize(
                 with tempfile.TemporaryDirectory() as temp_dir:
                     num_cores = multiprocessing.cpu_count()
                     with ProcessPoolExecutor(max_workers=num_cores) as executor:
-                        futures = [executor.submit(process_image, (png, temp_dir, i)) for i, png in enumerate(filtered_files)]
+                        futures = {executor.submit(process_image, (png, temp_dir, i)): i for i, png in enumerate(filtered_files)}
+                        results = [None] * len(filtered_files)
                         for future in as_completed(futures):
                             try:
-                                pdf_path, extracted_text = future.result()
-                                merger.append(pdf_path)
-                                all_text += extracted_text + "\n"
+                                i = futures[future]
+                                results[i] = future.result()
                                 progress.advance(image_task)
                             except Exception as e:
                                 console.print(f"[red]Error processing image: {e}[/red]")
+
+                    for pdf_path, extracted_text in results:
+                        if pdf_path and extracted_text:
+                            merger.append(pdf_path)
+                            all_text += extracted_text + "\n"
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_output_file:
                 temp_output_pdf_path = temp_output_file.name

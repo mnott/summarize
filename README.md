@@ -73,9 +73,9 @@ This script is released under the [WTFPL License](https://en.wikipedia.org/wiki/
 
 A context manager for suppressing stdout and stderr output.
 
-## sort_by_creation_time
+## sort_by_directory_order
 
-Sort files by their creation time.
+Sort files to match the exact order shown in the directory listing.
 
 Args:
     files (List): List of file paths.
@@ -85,31 +85,23 @@ Returns:
 
 ## crop_image
 
-Crop an image to remove any surrounding whitespace.
+Crop an image to remove any surrounding whitespace and add padding for print borders.
 
 Args:
     image_path (str): Path to the image file.
+    padding (int): Amount of padding to add around the cropped area. Default is 10 pixels.
 
 Returns:
-    PIL.Image.Image: Cropped image.
-
-## get_max_width
-
-Get the maximum width among a list of images.
-
-Args:
-    image_paths (List): List of image file paths.
-
-Returns:
-    int: Maximum width.
+    PIL.Image.Image: Cropped image with padding.
 
 ## convert_images_to_pdf
 
-Convert a list of images to a single PDF file.
+Convert a list of images to a single PDF file with proportional padding and maintained quality.
 
 Args:
     image_paths (List): List of image file paths.
     output_path (str): Path to save the output PDF.
+    padding_ratio (float): Ratio of padding to add around the cropped area of each image relative to the page width. Default is 0.05 (5% of the page width).
 
 ## apply_ocr
 
@@ -135,11 +127,12 @@ Returns:
 
 ## filter_similar_images
 
-Filter out similar images from a list of image files.
+Filter out similar images from a list of image files using parallel processing.
 
 Args:
     image_files (List): List of image file paths.
     threshold (float): Similarity threshold.
+    num_workers (int, optional): Number of parallel workers to use. Default is None, which uses all available cores.
 
 Returns:
     List: Filtered list of image file paths.
