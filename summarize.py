@@ -691,8 +691,8 @@ def create_summary_pdf(summary, output_path, css_path):
     # Parse HTML and create paragraphs or tables for styled elements
     for element in soup.descendants:
         if element.name in ['h1', 'h2']:
-            if element.name == 'h2':
-                story.append(Spacer(1, 6))
+            #if element.name == 'h2':
+            story.append(Spacer(1, 12))
             style_name = 'heading1' if element.name == 'h1' else 'heading2'
             text = element.get_text().strip()
             style = styles.get(style_name, sample_styles['Heading1'])
