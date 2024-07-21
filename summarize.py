@@ -301,23 +301,37 @@ def are_images_similar(img1_path, img2_path, threshold=0.95):
     return similarity > threshold
 
 
-def filter_similar_images(image_files, threshold=0.95):
+def check_similarity(args):
+    img, image, threshold = args
+    return are_images_similar(img, image, threshold)
+
+def filter_similar_images(image_files, threshold=0.95, num_workers=None, progress=None, filter_task=None):
     """
-    Filter out similar images from a list of image files.
+    Filter out similar images from a list of image files using parallel processing.
 
     Args:
         image_files (List[str]): List of image file paths.
         threshold (float): Similarity threshold.
+        num_workers (int, optional): Number of parallel workers to use. Default is None, which uses all available cores.
 
     Returns:
         List[str]: Filtered list of image file paths.
     """
     if not image_files:
         return []
+
     filtered_images = [image_files[0]]
-    for i in range(1, len(image_files)):
-        if not any(are_images_similar(img, image_files[i], threshold) for img in filtered_images):
-            filtered_images.append(image_files[i])
+    remaining_images = image_files[1:]
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        for image in remaining_images:
+            tasks = [(img, image, threshold) for img in filtered_images]
+            similarities = list(executor.map(check_similarity, tasks))
+            if not any(similarities):
+                filtered_images.append(image)
+            if progress:
+                progress.advance(filter_task)
+
     return filtered_images
 
 
@@ -655,11 +669,6 @@ def summarize(
     all_text = ""
 
     with Progress() as progress:
-        prepare_task = progress.add_task("[cyan]Preparing files...", total=1)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_output_file:
-            temp_output_pdf_path = temp_output_file.name
-
         try:
             merger = PdfMerger()
 
@@ -681,7 +690,11 @@ def summarize(
                         console.print(f"[red]Skipping invalid image file: {image}[/red]")
 
                 sorted_files = sort_by_creation_time(valid_images)
-                filtered_files = filter_similar_images(sorted_files)
+
+                # Filter similar images with progress update
+                filter_task = progress.add_task("[blue]Filtering  images...", total=len(sorted_files))
+                filtered_files = filter_similar_images(sorted_files, num_workers=multiprocessing.cpu_count(), progress=progress, filter_task=filter_task)
+                progress.update(filter_task, advance=len(sorted_files) - len(filtered_files))
 
                 image_task = progress.add_task("[blue]Processing images...", total=len(filtered_files))
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -697,6 +710,9 @@ def summarize(
                             except Exception as e:
                                 console.print(f"[red]Error processing image: {e}[/red]")
 
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_output_file:
+                temp_output_pdf_path = temp_output_file.name
+
             merger.write(temp_output_pdf_path)
             merger.close()
 
@@ -704,7 +720,6 @@ def summarize(
             console.print(f"[red]Error creating the final PDF: {str(e)}[/red]")
             return
 
-        progress.advance(prepare_task)
         progress.stop()
 
         summary = generate_summary(all_text, max_tokens)
@@ -739,7 +754,7 @@ def summarize(
         except Exception as e:
             console.print(f"[red]Error creating summary PDF: {str(e)}[/red]")
         finally:
-            if os.path.exists(temp_output_pdf_path):
+            if 'temp_output_pdf_path' in locals() and os.path.exists(temp_output_pdf_path):
                 os.remove(temp_output_pdf_path)
 
 
