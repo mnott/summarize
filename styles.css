@@ -23,8 +23,9 @@
 
 .bullet {
     margin-left: 20px;
-    text-indent: -10px;
+    text-indent: -14px;
     margin-bottom: 6px;
+    font-size: 11px;
 }
 
 .bodytext {

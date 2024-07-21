@@ -637,6 +637,8 @@ def create_summary_pdf(summary, output_path, css_path):
     # Parse HTML and create paragraphs or tables for styled elements
     for element in soup.descendants:
         if element.name in ['h1', 'h2']:
+            if element.name == 'h2':
+                story.append(Spacer(1, 6))
             style_name = 'heading1' if element.name == 'h1' else 'heading2'
             text = element.get_text().strip()
             style = styles.get(style_name, sample_styles['Heading1'])
@@ -660,15 +662,14 @@ def create_summary_pdf(summary, output_path, css_path):
                 ('LEADING', (0,0), (-1,-1), style.leading),
             ]))
             story.append(t)
-
-            story.append(Spacer(1, parse_css_value(style.spaceAfter, 12)))
+            if element.name == 'h1':
+                story.append(Spacer(1, parse_css_value(style.spaceAfter, 12)))
         elif element.name == 'p':
             story.append(Paragraph(element.get_text(), styles.get('bodytext', sample_styles['BodyText'])))
-            story.append(Spacer(1, 12))
         elif element.name == 'ul':
             for li in element.find_all('li'):
                 story.append(Paragraph(f'• {li.get_text()}', styles.get('bullet', sample_styles['BodyText'])))
-                story.append(Spacer(1, 12))
+                story.append(Spacer(1, 6))
 
     # Add a page break for multi-page support
     story.append(PageBreak())
