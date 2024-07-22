@@ -776,6 +776,7 @@ def summarize(
                     all_text += text + "\n"
                     progress.advance(pdf_task)
 
+            filtered_files = []
             if image_files:
                 valid_images = []
                 for image in image_files:
@@ -833,7 +834,13 @@ def summarize(
         progress.stop()
 
         # Generate final output filename
-        first_file_modification_time = datetime.fromtimestamp(os.path.getmtime(filtered_files[0])) if filtered_files else datetime.now()
+        if image_files and filtered_files:
+            first_file_modification_time = datetime.fromtimestamp(os.path.getmtime(filtered_files[0]))
+        elif pdf_files:
+            first_file_modification_time = datetime.fromtimestamp(os.path.getmtime(pdf_files[0]))
+        else:
+            first_file_modification_time = datetime.now()
+
         date_time_str = first_file_modification_time.strftime("%Y%m%d_%H%M")
         output_base_name = os.path.splitext(output_file)[0]
         final_output_filename = f"{output_base_name}_{date_time_str}.pdf"
