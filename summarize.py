@@ -5,7 +5,10 @@ r"""
 # summarize: Convert Screen Shots into a Readable Text and create a summary; also works with PDFs.
 
 This script provides functionality to convert screenshots and PDFs into a readable text format,
-generate summaries, and create styled PDF outputs.
+generate summaries, and create styled PDF outputs. It can operate in two modes:
+
+1. **Image Mode**: Process PNG/JPG/JPEG screenshots in the current directory
+2. **PDF Mode**: Recursively analyze PDFs in subdirectories with financial summary
 
 # Installation
 
@@ -45,15 +48,58 @@ To get help about the script, call it with the `--help` option:
 ./summarize.py --help
 ```
 
-## Summarize a bunch of images in the current directory
+## Automatic Mode Detection
+
+The script automatically detects which mode to use:
 
 ```bash
 ./summarize.py
 ```
 
-This will take only pgn, jpg, and jpeg files in the current directory and summarize them.
+- If PNG/JPG/JPEG files are found in the current directory → Image mode
+- If PDFs are found in subdirectories → PDF recursive analysis mode
 
-## Summarize some specific files in order
+## Image Mode: Summarize screenshots
+
+```bash
+./summarize.py
+```
+
+This will process PNG, JPG, and JPEG files in the current directory and create a styled PDF summary.
+
+## PDF Mode: Recursive financial analysis
+
+```bash
+./summarize.py
+```
+
+When PDFs are detected in subdirectories, the script will:
+- Recursively scan all subdirectories for PDF files
+- Extract text and amounts from each PDF
+- Generate AI summaries for each directory
+- Create aggregate summaries for parent directories
+- Output three files at the root level:
+  - `summary_TIMESTAMP.json` - Complete analysis data
+  - `summary_TIMESTAMP.xlsx` - Excel workbook with financial summary
+  - `summary_TIMESTAMP.pdf` - Formatted PDF report
+
+### Features:
+- **Multi-currency support**: Automatically detects and tracks any valid ISO currency
+- **Smart amount extraction**: Finds total amounts in receipts across multiple languages
+- **Parallel processing**: Uses multiple threads for faster analysis
+- **Rate limit handling**: Gracefully handles API rate limiting
+- **Non-receipt PDFs**: Processes all PDFs, even non-financial documents
+
+### Output Format:
+The Excel summary includes:
+- Directory path
+- Document type (PDFs or Aggregate)
+- Number of documents
+- Processing date
+- Separate columns for each currency found
+- Total row with sums (using SUBTOTAL for filtering support)
+
+## Summarize specific files
 
 ```bash
 ./summarize.py file1.png file2.pdf
@@ -76,6 +122,7 @@ This script is released under the [WTFPL License](https://en.wikipedia.org/wiki/
 import contextlib
 import glob
 import io
+import json
 import logging
 import multiprocessing
 import os
@@ -84,19 +131,25 @@ import shutil
 import sys
 import tempfile
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 # Third-party imports
 import cssutils
-import fitz
+import pymupdf as fitz
 import img2pdf
 import markdown
 import nltk
 import numpy as np
+import pandas as pd
 import pytesseract
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table as ExcelTable, TableStyleInfo
 import spacy
 import traceback
 import typer
@@ -118,7 +171,7 @@ from reportlab.pdfgen import canvas
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, PageBreak, Table, TableStyle
 from rich import print
 from rich.console import Console
-from rich.progress import Progress
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from skimage.metrics import structural_similarity as ssim
 from transformers import pipeline
 
@@ -139,6 +192,7 @@ app = typer.Typer(
     help="summarize: Convert Screen Shots into a Readable Text and create a summary; also works with PDFs.",
     epilog="To get help about the script, call it with the --help option."
 )
+
 
 
 class SuppressOutput:
@@ -170,6 +224,1082 @@ transformers_logger.setLevel(logging.CRITICAL)
 with SuppressOutput():
     nltk.download('punkt', quiet=True)
     nltk.download('stopwords', quiet=True)
+
+
+def find_pdfs_recursively(directory: Path) -> Dict[Path, List[Path]]:
+    """
+    Find all PDF files recursively in a directory and group them by parent directory.
+    Excludes generated summary PDFs to avoid double processing.
+    
+    Args:
+        directory: Root directory to search
+        
+    Returns:
+        Dictionary mapping directory paths to lists of PDF files in that directory
+    """
+    pdf_map = {}
+    
+    # Pattern to match our generated summary PDFs
+    summary_pattern = re.compile(r'^summary_\d{8}_\d{6}\.pdf$')
+    
+    for root, dirs, files in os.walk(directory):
+        root_path = Path(root)
+        pdf_files = []
+        
+        for f in files:
+            if f.lower().endswith('.pdf'):
+                # Exclude our generated summary PDFs
+                if not summary_pattern.match(f):
+                    pdf_files.append(root_path / f)
+        
+        if pdf_files:
+            pdf_map[root_path] = pdf_files
+            
+    return pdf_map
+
+
+def extract_text_from_pdf_simple(pdf_path: Path) -> Dict[str, any]:
+    """
+    Extract all text from a PDF file (without OCR - assumes text is already embedded).
+    
+    Args:
+        pdf_path: Path to the PDF file
+        
+    Returns:
+        Dictionary containing extracted text and metadata
+    """
+    try:
+        doc = fitz.open(str(pdf_path))
+        
+        full_text = []
+        page_texts = []
+        
+        for page_num, page in enumerate(doc, 1):
+            # Extract text from the page
+            text = page.get_text()
+            
+            # Clean up the text
+            text = text.strip()
+            
+            # Also check for text in annotations
+            annot_texts = []
+            for annot in page.annots():
+                if annot:
+                    content = annot.info.get('content', '')
+                    if content and content.strip():
+                        annot_texts.append(content.strip())
+            
+            # Combine regular text and annotation text
+            if annot_texts and not text:
+                text = "Annotations: " + "; ".join(annot_texts)
+            elif annot_texts and text:
+                text = text + "\nAnnotations: " + "; ".join(annot_texts)
+            
+            # Check if page has images but no text (likely needs OCR)
+            if not text and page.get_images():
+                text = "[Page contains images but no extractable text - OCR may be needed]"
+            
+            if text:
+                page_texts.append({
+                    'page': page_num,
+                    'text': text
+                })
+                full_text.append(f"--- Page {page_num} ---\n{text}")
+        
+        doc.close()
+        
+        # Get file metadata
+        stat = pdf_path.stat()
+        
+        return {
+            'filename': pdf_path.name,
+            'path': str(pdf_path),
+            'pages': len(page_texts),
+            'modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            'size_bytes': stat.st_size,
+            'full_text': '\n\n'.join(full_text),
+            'page_texts': page_texts
+        }
+        
+    except Exception as e:
+        console.print(f"[red]Error extracting text from {pdf_path}: {e}[/red]")
+        return {
+            'filename': pdf_path.name,
+            'path': str(pdf_path),
+            'error': str(e)
+        }
+
+
+def extract_amounts_from_text(text: str) -> List[Tuple[float, str]]:
+    """
+    Extract monetary amounts and their currencies from text.
+    Focus on total amounts in summaries.
+    
+    Returns:
+        List of (amount, currency) tuples
+    """
+    # Common valid currency codes (ISO 4217)
+    VALID_CURRENCIES = {
+        'USD', 'EUR', 'GBP', 'CHF', 'JPY', 'AUD', 'CAD', 'CNY', 'SEK', 'NOK',
+        'DKK', 'PLN', 'CZK', 'HUF', 'RON', 'BGN', 'HRK', 'RUB', 'TRY', 'BRL',
+        'MXN', 'ARS', 'CLP', 'COP', 'PEN', 'UYU', 'INR', 'IDR', 'KRW', 'MYR',
+        'PHP', 'SGD', 'THB', 'VND', 'ZAR', 'AED', 'SAR', 'ILS', 'NZD', 'TWD',
+        'HKD', 'ISK', 'RSD', 'UAH', 'KZT', 'GEL', 'AMD', 'AZN', 'BYN', 'MDL',
+        'MKD', 'ALL', 'BAM', 'EGP', 'MAD', 'TND', 'JOD', 'KWD', 'LBP', 'DZD'
+    }
+    
+    amounts = []
+    found_totals = set()  # Track found amounts to avoid duplicates
+    
+    # If the text indicates no extractable content, return empty
+    if '[Page contains images but no extractable text' in text or 'OCR may be needed' in text:
+        return []
+    
+    # Currency pattern - matches any 3-letter uppercase currency code
+    currency_pattern = r'[A-Z]{3}'
+    
+    # Priority patterns - look for total amounts first
+    # Updated patterns to handle thousands separators (1,234.56 or 1'234.56 or 1 234,56)
+    priority_patterns = [
+        # Total patterns with various formats - now handles thousands separators
+        rf'Total amount:\s*({currency_pattern})\s*[:.]?\s*([\d,\'\s]+(?:\.\d+)?)',
+        rf'Total amount:\s*([\d,\'\s]+(?:\.\d+)?)\s*({currency_pattern})',
+        rf'Total:\s*({currency_pattern})\s*[:.]?\s*([\d,\'\s]+(?:\.\d+)?)',
+        rf'Total:\s*([\d,\'\s]+(?:\.\d+)?)\s*({currency_pattern})',
+        rf'Total spending[^:]*:\s*({currency_pattern})\s*[:.]?\s*([\d,\'\s]+(?:\.\d+)?)',
+        rf'Total spending[^:]*:\s*([\d,\'\s]+(?:\.\d+)?)\s*({currency_pattern})',
+        # French/German variants
+        rf'Montant total:\s*({currency_pattern})\s*[:.]?\s*([\d,\'\s]+(?:\.\d+)?)',
+        rf'Montant total:\s*([\d,\'\s]+(?:\.\d+)?)\s*({currency_pattern})',
+        rf'Montant:\s*({currency_pattern})\s*[:.]?\s*([\d,\'\s]+(?:\.\d+)?)',
+        rf'Montant:\s*([\d,\'\s]+(?:\.\d+)?)\s*({currency_pattern})',
+        rf'Betrag:\s*({currency_pattern})\s*[:.]?\s*([\d,\'\s]+(?:\.\d+)?)',
+        rf'Betrag:\s*([\d,\'\s]+(?:\.\d+)?)\s*({currency_pattern})',
+    ]
+    
+    # Look for priority patterns first
+    for pattern in priority_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
+        for match in matches:
+            # Determine which group contains the currency and which contains the amount
+            groups = match.groups()
+            currency = None
+            amount_str = None
+            
+            for group in groups:
+                if group and re.match(r'^[A-Z]{3}$', group.upper()):
+                    currency = group.upper()
+                elif group:
+                    amount_str = group
+            
+            if currency and amount_str:
+                # Validate currency code
+                if currency not in VALID_CURRENCIES:
+                    continue
+                    
+                # Remove thousands separators (comma, apostrophe, space)
+                amount_str = amount_str.replace(',', '').replace("'", '').replace(' ', '')
+                try:
+                    amount = float(amount_str)
+                    
+                    # Validate amount is reasonable
+                    if amount < 0.01 or amount > 999999999:  # Less than 1 cent or more than 999 million
+                        continue
+                        
+                    key = (amount, currency)
+                    if key not in found_totals:
+                        found_totals.add(key)
+                        amounts.append(key)
+                except ValueError:
+                    continue
+    
+    # If we found totals, return them all (let the caller decide which to use)
+    if amounts:
+        return amounts
+    
+    # If no totals found, look for any amount mentions (less reliable)
+    fallback_patterns = [
+        rf'({currency_pattern})\s*[:.]?\s*(\d+(?:[.,]\d+)?)',
+        rf'(\d+(?:[.,]\d+)?)\s*({currency_pattern})',
+    ]
+    
+    for pattern in fallback_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                # Determine which group contains the currency and which contains the amount
+                groups = match.groups()
+                currency = None
+                amount_str = None
+                
+                for group in groups:
+                    if group and re.match(r'^[A-Z]{3}$', group.upper()):
+                        currency = group.upper()
+                    elif group:
+                        amount_str = group
+                
+                if currency and amount_str:
+                    # Validate currency code
+                    if currency not in VALID_CURRENCIES:
+                        continue
+                        
+                    amount_str = amount_str.replace(',', '.')
+                    try:
+                        amount = float(amount_str)
+                        
+                        # Validate amount is reasonable
+                        if amount < 0.01 or amount > 999999999:
+                            continue
+                        
+                        key = (amount, currency)
+                        if key not in found_totals:
+                            found_totals.add(key)
+                            amounts.append(key)
+                    except ValueError:
+                        continue
+    
+    return amounts
+
+
+def create_pdf_summary(texts: List[Dict], directory: Path) -> str:
+    """
+    Create a summary of extracted PDF texts using AI.
+    
+    Args:
+        texts: List of extracted text dictionaries
+        directory: Directory being processed
+        
+    Returns:
+        Summary text
+    """
+    # Prepare content for summarization
+    content_parts = []
+    
+    for doc in texts:
+        if 'error' not in doc:
+            content_parts.append(f"File: {doc['filename']}")
+            content_parts.append(f"Modified: {doc['modified']}")
+            content_parts.append(f"Full text:\n{doc['full_text']}")
+            content_parts.append("\n---\n")
+    
+    combined_text = '\n'.join(content_parts)
+    
+    # Use AI to generate summary
+    ai_client = AIClient(config_provider=GitConfig())
+    
+    prompt = f"""
+    Analyze the following receipt/document texts extracted from PDF files in {directory.name}.
+    Create a structured summary that includes:
+    
+    1. Overview of all documents found
+    2. For receipts: extract key information like:
+       - Date (look for date formats, dates, datum, data)
+       - Vendor/Company name
+       - Total amount (look for: total, montant, betrag, importo, amount, CHF, EUR, USD, summe, somme)
+       - Items purchased (if visible)
+       - Payment method (credit card, debit, cash, bar, carte, karte)
+    3. Total spending across all receipts (if applicable)
+    4. Any patterns or notable observations
+    
+    IMPORTANT: 
+    - The receipts may be in multiple languages (English, French, German, Italian).
+    - Look for amount indicators like: Total, Montant, Betrag, Importo, Summe, Somme, CHF, EUR, USD
+    - ALWAYS include a clear total line at the end in this format: "Total: CHF 123.45" (or EUR, USD, etc.)
+    - If there are multiple currencies, list each total separately like:
+      Total: CHF 100.00
+      Total: EUR 50.00
+    
+    Format the output as a clear, structured text that can be used for later analysis.
+    
+    Documents to analyze:
+    
+    {combined_text}
+    """
+    
+    try:
+        response = ai_client.prompt(prompt, tokens=1500)
+        return response
+    except Exception as e:
+        error_msg = str(e)
+        
+        # Check for specific error codes
+        if "529" in error_msg:
+            console.print(f"[red]⚠️  Rate limit exceeded - API is temporarily unavailable[/red]")
+            console.print(f"[yellow]   The AI service is currently overloaded. Please try again in a few minutes.[/yellow]")
+            return "Summary unavailable due to rate limiting. The API service is temporarily overloaded."
+        elif "401" in error_msg:
+            console.print(f"[red]Authentication error - please check your API key[/red]")
+            return "Summary unavailable due to authentication error."
+        elif "500" in error_msg or "502" in error_msg or "503" in error_msg:
+            console.print(f"[red]Server error - the AI service is experiencing issues[/red]")
+            return "Summary unavailable due to server error."
+        else:
+            console.print(f"[red]Error generating AI summary: {e}[/red]")
+            return f"Error generating summary: {e}"
+
+
+def process_pdf_directory(directory: Path, show_progress: bool = True) -> Dict:
+    """
+    Process all PDFs in a directory and create a summary file.
+    
+    Args:
+        directory: Directory to process
+        output_format: Output format ('txt' or 'json')
+        show_progress: Whether to show progress messages
+        
+    Returns:
+        Processing results
+    """
+    pdf_files = [f for f in directory.iterdir() if f.suffix.lower() == '.pdf']
+    
+    if not pdf_files:
+        return {'directory': str(directory), 'pdfs': 0, 'status': 'no_pdfs'}
+    
+    if show_progress:
+        console.print(f"[blue]Processing {len(pdf_files)} PDFs in {directory}[/blue]")
+    
+    # Extract text from all PDFs
+    extracted_texts = []
+    for pdf_file in pdf_files:
+        if show_progress:
+            console.print(f"  Extracting: {pdf_file.name}")
+        extracted = extract_text_from_pdf_simple(pdf_file)
+        extracted_texts.append(extracted)
+    
+    # Create summary
+    summary = create_pdf_summary(extracted_texts, directory)
+    
+    # Extract amounts from the summary for structured data
+    summary_amounts = extract_amounts_from_text(summary)
+    
+    # If no amounts found in summary, try to extract from individual documents
+    if not summary_amounts:
+        all_doc_amounts = []
+        for doc in extracted_texts:
+            if 'error' not in doc and 'full_text' in doc:
+                doc_amounts = extract_amounts_from_text(doc['full_text'])
+                all_doc_amounts.extend(doc_amounts)
+        
+        # Aggregate by currency
+        currency_totals = defaultdict(float)
+        for amount, currency in all_doc_amounts:
+            currency_totals[currency] += amount
+        
+        summary_amounts = [(total, currency) for currency, total in currency_totals.items()]
+    else:
+        # If we found multiple amounts for the same currency, use the largest (likely the total)
+        currency_amounts = defaultdict(list)
+        for amount, currency in summary_amounts:
+            currency_amounts[currency].append(amount)
+        
+        # For each currency, take the maximum amount (which should be the total)
+        summary_amounts = [(max(amounts), currency) for currency, amounts in currency_amounts.items()]
+    
+    # Return all data in memory instead of writing files
+    return {
+        'directory': str(directory),
+        'processed_date': datetime.now().isoformat(),
+        'documents': extracted_texts,
+        'summary': summary,
+        'extracted_amounts': [{'amount': amt, 'currency': curr} for amt, curr in summary_amounts],
+        'total_files': len(pdf_files),
+        'status': 'success'
+    }
+
+
+def create_aggregate_summary(directory: Path, subdirectory_results: List[Dict]) -> Dict:
+    """
+    Create an aggregate summary for a parent directory based on subdirectory results.
+    Returns both the summary text and structured data.
+    """
+    # Process all subdirectory summaries from in-memory data
+    all_amounts = defaultdict(list)  # currency -> list of amounts
+    total_receipts = 0
+    subdirs_with_pdfs = []
+    all_documents = []
+    
+    for result in subdirectory_results:
+        if result.get('status') == 'success' and result.get('total_files', 0) > 0:
+            dir_path = Path(result['directory'])
+            subdirs_with_pdfs.append(dir_path.name)
+            
+            # Extract amounts from the result data
+            if 'extracted_amounts' in result:
+                for amt_data in result['extracted_amounts']:
+                    all_amounts[amt_data['currency']].append(amt_data['amount'])
+            
+            # Count receipts/documents
+            total_receipts += result.get('total_files', 0)
+            
+            # Collect all documents for reference
+            all_documents.extend(result.get('documents', []))
+    
+    # Calculate totals by currency
+    currency_totals = {}
+    
+    for currency, amounts in all_amounts.items():
+        currency_total = sum(amounts)
+        currency_totals[currency] = currency_total
+    
+    # Generate AI summary
+    ai_client = AIClient(config_provider=GitConfig())
+    
+    prompt = f"""
+    Create an aggregate summary for the directory '{directory.name}' which contains the following subdirectories with receipts/documents:
+    
+    Subdirectories analyzed: {', '.join(subdirs_with_pdfs)}
+    Total documents found: {total_receipts}
+    
+    Currency totals found:
+    {chr(10).join(f'- {currency}: {total:.2f}' for currency, total in currency_totals.items())}
+    
+    Create a concise summary that:
+    1. Summarizes what types of expenses/documents were found
+    2. Lists the total spending by currency
+    3. Notes any patterns or interesting observations across the subdirectories
+    
+    Keep it brief and focused on the financial overview.
+    """
+    
+    try:
+        response = ai_client.prompt(prompt, tokens=800)
+        return {
+            'summary_text': response,
+            'extracted_amounts': [{'amount': total, 'currency': curr} for curr, total in currency_totals.items()],
+            'subdirectories': subdirs_with_pdfs,
+            'total_documents': total_receipts
+        }
+    except Exception as e:
+        # Fallback summary if AI fails
+        summary = f"Aggregate Summary for {directory.name}\n\n"
+        summary += f"Subdirectories analyzed: {len(subdirs_with_pdfs)}\n"
+        summary += f"Total documents: {total_receipts}\n\n"
+        summary += "Currency totals:\n"
+        for currency, total in currency_totals.items():
+            summary += f"- {currency}: {total:.2f}\n"
+        return {
+            'summary_text': summary,
+            'extracted_amounts': [{'amount': total, 'currency': curr} for curr, total in currency_totals.items()],
+            'subdirectories': subdirs_with_pdfs,
+            'total_documents': total_receipts
+        }
+
+
+def cleanup_intermediate_files(directory: Path, timestamp: str, keep_root: bool = True):
+    """
+    Remove all intermediate summary files recursively, optionally keeping root files.
+    
+    Args:
+        directory: Root directory
+        timestamp: Run timestamp to identify files from this run
+        keep_root: If True, keep files in the root directory
+    """
+    # Patterns for files to clean up
+    patterns = [
+        f'summary_{timestamp}.json',
+        f'summary_{timestamp}.txt',
+        f'summary_{timestamp}.xlsx'
+    ]
+    
+    for pattern in patterns:
+        for file in directory.rglob(pattern):
+            # Skip root directory files if keep_root is True
+            if keep_root and file.parent == directory:
+                continue
+                
+            try:
+                file.unlink()
+                console.print(f"[yellow]Cleaned up {file.relative_to(directory)}[/yellow]")
+            except Exception as e:
+                console.print(f"[red]Error removing {file}: {e}[/red]")
+
+
+def create_master_json(directory: Path, all_data: Dict, timestamp: str) -> Path:
+    """
+    Create a master JSON file with all data from the analysis.
+    
+    Args:
+        directory: Root directory for the analysis
+        all_data: Complete in-memory data structure
+        timestamp: Run timestamp
+        
+    Returns:
+        Path to the created master JSON file
+    """
+    master_data = {
+        'analysis_date': datetime.now().isoformat(),
+        'root_directory': str(directory),
+        'directories': all_data
+    }
+    
+    # Save master JSON
+    master_json = directory / f"summary_{timestamp}.json"
+    with open(master_json, 'w', encoding='utf-8') as f:
+        json.dump(master_data, f, indent=2, ensure_ascii=False)
+    
+    return master_json
+
+
+def create_summary_pdf_from_data(all_data: Dict, output_path: Path, css_file: str = None) -> None:
+    """
+    Create a styled PDF summary from the analysis data.
+    
+    Args:
+        all_data: Complete in-memory data structure
+        output_path: Path for the output PDF
+        css_file: Optional CSS file for styling
+    """
+    # Create markdown content with meaningful summary text
+    md_parts = [
+        "# PDF Analysis Summary",
+        f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        ""
+    ]
+    
+    # Track totals and details for summary
+    total_docs = 0
+    currency_totals = defaultdict(float)
+    directories_processed = []
+    aggregate_dirs = []
+    
+    # Process data to gather information
+    for rel_path, data in sorted(all_data.items()):
+        if data.get('status') == 'success':
+            if data.get('aggregate', False):
+                aggregate_dirs.append(rel_path)
+                doc_count = data.get('total_documents', 0)
+            else:
+                directories_processed.append(rel_path)
+                doc_count = data.get('total_files', 0)
+            
+            total_docs += doc_count
+            
+            # Collect currency totals
+            if data.get('extracted_amounts'):
+                for amt in data['extracted_amounts']:
+                    currency_totals[amt['currency']] += amt['amount']
+    
+    # Create summary text
+    md_parts.append("## Analysis Overview")
+    md_parts.append("")
+    md_parts.append(f"This analysis was completed on **{datetime.now().strftime('%B %d, %Y at %H:%M')}**.")
+    md_parts.append("")
+    
+    if directories_processed:
+        md_parts.append("### Directories Analyzed")
+        md_parts.append("")
+        md_parts.append(f"Processed **{total_docs} PDF documents** across **{len(directories_processed)} directories**:")
+        md_parts.append("")
+        for dir_path in directories_processed:
+            md_parts.append(f"- {dir_path}")
+        md_parts.append("")
+    
+    if aggregate_dirs:
+        md_parts.append("### Aggregate Summaries")
+        md_parts.append("")
+        md_parts.append("The following aggregate summaries were created:")
+        md_parts.append("")
+        for agg_dir in aggregate_dirs:
+            md_parts.append(f"- {agg_dir}")
+        md_parts.append("")
+    
+    md_parts.append("### Financial Summary")
+    md_parts.append("")
+    
+    if currency_totals:
+        md_parts.append("**Amounts by Currency:**")
+        md_parts.append("")
+        for currency, amount in sorted(currency_totals.items()):
+            if amount > 0:  # Only show currencies with amounts
+                md_parts.append(f"- **{currency}:** {amount:,.2f}")
+        md_parts.append("")
+    else:
+        md_parts.append("No financial amounts were extracted from the documents.")
+        md_parts.append("")
+    
+    md_parts.append("### Notes")
+    md_parts.append("")
+    md_parts.append("- All amounts were extracted from PDF receipts using OCR and AI analysis")
+    md_parts.append("- Detailed breakdowns are available in the Excel summary file")
+    md_parts.append("- Non-receipt documents are included in the analysis but may not have financial data")
+    md_parts.append("")
+    
+    markdown_content = '\n'.join(md_parts)
+    
+    # If no CSS file provided, create a default one
+    if not css_file:
+        default_css = """
+        body { font-family: Arial, sans-serif; }
+        h1 { color: #333; }
+        h2 { color: #666; margin-top: 20px; }
+        strong { color: #444; }
+        """
+        temp_css = output_path.parent / "temp_style.css"
+        with open(temp_css, 'w') as f:
+            f.write(default_css)
+        css_file = str(temp_css)
+        
+        # Create the PDF
+        create_summary_pdf(markdown_content, str(output_path), css_file)
+        
+        # Clean up temp CSS
+        temp_css.unlink()
+    else:
+        create_summary_pdf(markdown_content, str(output_path), css_file)
+
+
+
+def create_excel_summary(directory: Path, all_data: Dict, timestamp: str = None) -> Path:
+    """
+    Create an Excel file with structured summary data.
+    
+    Args:
+        directory: Root directory for the analysis
+        all_data: Complete in-memory data structure
+        timestamp: Run timestamp
+        
+    Returns:
+        Path to the created Excel file
+    """
+    # Prepare summary data for main sheet
+    summary_rows = []
+    
+    for relative_path, data in all_data.items():
+        if data.get('status') == 'success':
+            # Parse the processed date to datetime
+            processed_date = data.get('processed_date', '')
+            if processed_date:
+                try:
+                    processed_dt = datetime.fromisoformat(processed_date)
+                except:
+                    processed_dt = None
+            else:
+                processed_dt = None
+            
+            if data.get('aggregate', False):
+                # Aggregate summary
+                row = {
+                    'Directory': str(relative_path),
+                    'Type': 'Aggregate',
+                    'Documents': data.get('total_documents', 0),
+                    'Date': processed_dt.date() if processed_dt else None
+                }
+                # Add currency columns
+                for amt_data in data.get('extracted_amounts', []):
+                    currency = amt_data['currency']
+                    row[f'{currency} Total'] = amt_data['amount']
+            else:
+                # Regular PDF directory summary
+                row = {
+                    'Directory': str(relative_path),
+                    'Type': 'PDFs',
+                    'Documents': data.get('total_files', 0),
+                    'Date': processed_dt.date() if processed_dt else None
+                }
+                # Add currency columns from extracted amounts
+                for amt_data in data.get('extracted_amounts', []):
+                    currency = amt_data['currency']
+                    row[f'{currency} Total'] = amt_data['amount']
+            
+            summary_rows.append(row)
+    
+    if not summary_rows:
+        console.print("[yellow]No data found for Excel summary[/yellow]")
+        return None
+    
+    # Create DataFrame for summary
+    summary_df = pd.DataFrame(summary_rows)
+    
+    # Sort by directory path
+    summary_df = summary_df.sort_values('Directory')
+    
+    # Use provided timestamp or generate new one
+    if timestamp is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    excel_file = directory / f"summary_{timestamp}.xlsx"
+    
+    # Create workbook with openpyxl directly for better control
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+    
+    # Write summary sheet first
+    headers = list(summary_df.columns)
+    for col, header in enumerate(headers, 1):
+        cell = ws_summary.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        cell.font = Font(color="FFFFFF", bold=True)
+    
+    # Write data
+    for row_idx, row_data in enumerate(summary_df.itertuples(index=False), 2):
+        for col_idx, value in enumerate(row_data, 1):
+            cell = ws_summary.cell(row=row_idx, column=col_idx, value=value)
+            
+            # Format numbers
+            if isinstance(value, (int, float)) and not pd.isna(value):
+                if 'Total' in headers[col_idx-1] or 'CHF' in headers[col_idx-1]:
+                    cell.number_format = '#,##0.00'
+                else:
+                    cell.number_format = '#,##0'
+            
+            # Format dates
+            elif headers[col_idx-1] == 'Date' and value:
+                cell.number_format = 'YYYY-MM-DD'
+    
+    # Create Excel table (don't include the sum row in the table)
+    table_range = f"A1:{get_column_letter(len(headers))}{len(summary_df) + 1}"
+    tab = ExcelTable(displayName="SummaryTable", ref=table_range)
+    
+    # Add table style
+    style = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False
+    )
+    tab.tableStyleInfo = style
+    ws_summary.add_table(tab)
+    
+    # Freeze panes (header row)
+    ws_summary.freeze_panes = ws_summary['A2']
+    
+    # Auto-adjust column widths for summary sheet
+    for column in ws_summary.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws_summary.column_dimensions[column_letter].width = adjusted_width
+    
+    # Add sum row at the bottom of the summary table
+    last_row = len(summary_df) + 2
+    ws_summary.cell(row=last_row, column=1, value="TOTAL").font = Font(bold=True)
+    
+    # Calculate sums for numeric columns
+    for col_idx, header in enumerate(headers, 1):
+        if 'Total' in header or header == 'Documents':
+            # Sum the values in this column using SUBTOTAL for filtering support
+            col_letter = get_column_letter(col_idx)
+            sum_formula = f"=SUBTOTAL(9,{col_letter}2:{col_letter}{last_row-1})"
+            cell = ws_summary.cell(row=last_row, column=col_idx, value=sum_formula)
+            cell.font = Font(bold=True)
+            
+            # Apply number format
+            if 'Total' in header or 'CHF' in header:
+                cell.number_format = '#,##0.00'
+            else:
+                cell.number_format = '#,##0'
+    
+    # Save workbook
+    wb.save(excel_file)
+    
+    return excel_file
+
+
+def display_summary_table(all_data: Dict):
+    """
+    Display a rich table with summary data in the console.
+    
+    Args:
+        all_data: Complete in-memory data structure
+    """
+    from rich.table import Table
+    
+    # Create the table
+    table = Table(title="PDF Analysis Summary", show_lines=True)
+    
+    # Add columns
+    table.add_column("Directory", style="cyan", no_wrap=True)
+    table.add_column("Type", style="magenta")
+    table.add_column("Documents", justify="right", style="green")
+    table.add_column("Date", style="blue")
+    
+    # Track which currencies we have
+    all_currencies = set()
+    for data in all_data.values():
+        if data.get('status') == 'success' and data.get('extracted_amounts'):
+            for amt in data['extracted_amounts']:
+                all_currencies.add(amt['currency'])
+    
+    # Add columns for each currency found
+    for currency in sorted(all_currencies):
+        table.add_column(f"{currency} Total", justify="right", style="yellow")
+    
+    # Track totals
+    total_docs = 0
+    currency_totals = defaultdict(float)
+    
+    # Add rows
+    for relative_path, data in sorted(all_data.items()):
+        if data.get('status') == 'success':
+            # Parse the processed date to datetime
+            processed_date = data.get('processed_date', '')
+            date_str = ""
+            if processed_date:
+                try:
+                    processed_dt = datetime.fromisoformat(processed_date)
+                    date_str = processed_dt.strftime('%Y-%m-%d')
+                except:
+                    pass
+            
+            # Basic data
+            dir_type = 'Aggregate' if data.get('aggregate', False) else 'PDFs'
+            doc_count = data.get('total_documents', data.get('total_files', 0))
+            total_docs += doc_count
+            
+            # Currency data
+            currency_amounts = {curr: 0 for curr in all_currencies}
+            
+            if data.get('extracted_amounts'):
+                for amt in data['extracted_amounts']:
+                    currency_amounts[amt['currency']] = amt['amount']
+                    currency_totals[amt['currency']] += amt['amount']
+            
+            # Build row data
+            row_data = [
+                str(relative_path),
+                dir_type,
+                str(doc_count),
+                date_str
+            ]
+            
+            # Add currency amounts
+            for currency in sorted(all_currencies):
+                amount = currency_amounts.get(currency, 0)
+                row_data.append(f"{amount:,.2f}" if amount > 0 else "-")
+            
+            table.add_row(*row_data)
+    
+    # Add total row
+    total_row = [
+        "[bold]TOTAL[/bold]",
+        "-",
+        f"[bold]{total_docs}[/bold]",
+        "-"
+    ]
+    
+    for currency in sorted(all_currencies):
+        total_row.append(f"[bold]{currency_totals[currency]:,.2f}[/bold]" if currency_totals[currency] > 0 else "-")
+    
+    table.add_row(*total_row)
+    
+    # Display the table
+    console.print(table)
+
+
+def analyze_pdfs_recursively(directory: Path, output_format: str = "txt", cleanup: bool = True, max_workers: int = 4) -> List[Dict]:
+    """
+    Recursively analyze PDFs in directories and create hierarchical summaries.
+    """
+    results = []
+    
+    # Generate a single timestamp for the entire run
+    run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False
+    ) as progress:
+        # Find all directories with PDFs
+        scan_task = progress.add_task("[cyan]📂 Scanning for PDF files...", total=None)
+        pdf_map = find_pdfs_recursively(directory)
+        progress.update(scan_task, completed=100, total=100)
+        
+        if not pdf_map:
+            console.print("[yellow]No PDF files found in the directory tree.[/yellow]")
+            return results
+        
+        progress.update(scan_task, description=f"[green]✅ Found {sum(len(pdfs) for pdfs in pdf_map.values())} PDFs in {len(pdf_map)} directories")
+        
+        task = progress.add_task(f"[cyan]📄 Processing directories (using {max_workers} threads)...", total=len(pdf_map))
+        
+        # Group results by parent directory
+        results_by_parent = defaultdict(list)
+        
+        # Process directories in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_dir = {}
+            for dir_path, pdf_files in pdf_map.items():
+                future = executor.submit(process_pdf_directory, dir_path, False)
+                future_to_dir[future] = (dir_path, pdf_files)
+            
+            # Process results as they complete
+            for future in as_completed(future_to_dir):
+                dir_path, pdf_files = future_to_dir[future]
+                rel_path = dir_path.relative_to(directory) if dir_path != directory else Path('.')
+                
+                try:
+                    result = future.result()
+                    results.append(result)
+                    
+                    # Show completion for this directory
+                    if result['status'] == 'success':
+                        progress.update(task, description=f"[green]✓ Processed [bold]{rel_path}[/bold]: {len(pdf_files)} PDFs")
+                        
+                        # Track results by parent directory
+                        parent = dir_path.parent
+                        if parent != directory and parent in pdf_map.keys():
+                            # Don't create aggregate for directories that have their own PDFs
+                            pass
+                        else:
+                            results_by_parent[parent].append(result)
+                    else:
+                        progress.update(task, description=f"[yellow]⚠ Skipped [bold]{rel_path}[/bold]: no PDFs")
+                        
+                except Exception as e:
+                    console.print(f"[red]Error processing {dir_path}: {e}[/red]")
+                    results.append({
+                        'directory': str(dir_path),
+                        'total_files': 0,
+                        'status': 'error',
+                        'error': str(e)
+                    })
+                
+                progress.advance(task)
+        
+        # Create aggregate summaries for parent directories
+        console.print("\n[blue]Creating aggregate summaries...[/blue]")
+        
+        # Create a complete data structure with all results
+        all_data = {}
+        for result in results:
+            if result['status'] == 'success':
+                dir_path = Path(result['directory'])
+                rel_path = str(dir_path.relative_to(directory)) if dir_path != directory else '.'
+                all_data[rel_path] = result
+        
+        # Build hierarchy and create aggregates bottom-up
+        dirs_to_process = set(Path(p) for p in all_data.keys())
+        aggregated_data = {}
+        
+        # Sort paths by depth (deepest first)
+        sorted_paths = sorted(dirs_to_process, key=lambda x: len(x.parts), reverse=True)
+        
+        # Process each directory and create aggregates for parents
+        for dir_path in sorted_paths:
+            rel_path = str(dir_path) if str(dir_path) != '.' else '.'
+            
+            # Find immediate children
+            children = []
+            for other_path in all_data.keys():
+                other = Path(other_path) if other_path != '.' else Path('.')
+                if other.parent == dir_path and other != dir_path:
+                    children.append(other_path)
+            
+            # Also check aggregated data for children
+            for other_path in aggregated_data.keys():
+                other = Path(other_path) if other_path != '.' else Path('.')
+                if other.parent == dir_path and other != dir_path and other_path not in children:
+                    children.append(other_path)
+            
+            # If this directory has children, create an aggregate
+            if children and rel_path not in all_data:
+                child_results = []
+                for child in children:
+                    if child in all_data:
+                        child_results.append(all_data[child])
+                    elif child in aggregated_data:
+                        child_results.append(aggregated_data[child])
+                
+                if child_results:
+                    aggregate_data = create_aggregate_summary(directory / dir_path, child_results)
+                    aggregated_data[rel_path] = {
+                        'directory': str(directory / dir_path),
+                        'processed_date': datetime.now().isoformat(),
+                        'aggregate': True,
+                        'subdirectories': aggregate_data['subdirectories'],
+                        'total_documents': aggregate_data['total_documents'],
+                        'extracted_amounts': aggregate_data['extracted_amounts'],
+                        'summary': aggregate_data['summary_text'],
+                        'status': 'success'
+                    }
+        
+        # Merge all data
+        all_data.update(aggregated_data)
+    
+    # Create master JSON with all data
+    master_json = create_master_json(directory, all_data, run_timestamp)
+    
+    # Create Excel summary at root level
+    excel_file = create_excel_summary(directory, all_data, run_timestamp)
+    
+    # Display summary table in console
+    console.print("\n[bold blue]Summary Results:[/bold blue]")
+    display_summary_table(all_data)
+    
+    # Create styled PDF summary
+    summary_pdf = directory / f"summary_{run_timestamp}.pdf"
+    
+    # Try to use the same CSS file as image summaries if available
+    # First check script directory
+    script_dir = Path(__file__).parent
+    css_file = script_dir / "styles.css"
+    if not css_file.exists():
+        # Then check output directory
+        css_file = directory / "styles.css"
+        if not css_file.exists():
+            css_file = None
+    
+    create_summary_pdf_from_data(all_data, summary_pdf, str(css_file) if css_file else None)
+    
+    # Check for rate limiting in the summaries
+    rate_limited = 0
+    for data in all_data.values():
+        if data.get('status') == 'success' and 'rate limiting' in data.get('summary', '').lower():
+            rate_limited += 1
+    
+    if rate_limited > 0:
+        console.print(f"\n[yellow]⚠️  Warning: {rate_limited} summaries were affected by API rate limiting.[/yellow]")
+        console.print("[yellow]   The service is currently overloaded. Consider re-running later for complete summaries.[/yellow]")
+    
+    # Print final summary
+    console.print(f"\n[green]✅ Analysis complete! Files created:[/green]")
+    console.print(f"   • summary_{run_timestamp}.json")
+    console.print(f"   • summary_{run_timestamp}.xlsx")
+    console.print(f"   • summary_{run_timestamp}.pdf")
+    
+    return results
+
+
+def detect_processing_mode(directory: Path = None) -> str:
+    """
+    Detect whether to use image processing or PDF recursive processing.
+    
+    Returns:
+        'images' for image processing (PNG/JPG/JPEG in current dir)
+        'pdfs' for recursive PDF processing (PDFs in subdirectories)
+        'none' if no processable files found
+    """
+    if directory is None:
+        directory = Path.cwd()
+    
+    # Check for images in current directory
+    image_patterns = ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']
+    image_files = []
+    for pattern in image_patterns:
+        image_files.extend(directory.glob(pattern))
+    
+    if image_files:
+        return 'images'
+    
+    # Check for PDFs in subdirectories
+    pdf_map = find_pdfs_recursively(directory)
+    if pdf_map:
+        return 'pdfs'
+    
+    return 'none'
 
 
 def sort_by_directory_order(files):
@@ -742,17 +1872,90 @@ def summarize(
     no_ai:                 bool = typer.Option(False,         "-n", "--no-ai",       help="Skip AI recognition and summary generation"),
 ):
     """
-    Generate a summary PDF from input files (PDFs or images).
+    Generate a summary from input files (PDFs or images).
 
-    This command processes input files (PDFs and images), extracts text, generates a summary,
-    and creates a styled PDF output with the summary and original content.
+    This command automatically detects the type of processing needed:
+    - If PNG/JPG/JPEG files are found in the current directory: Creates a styled PDF summary
+    - If PDFs are found in subdirectories: Creates recursive text summaries with totals
     """
     console.print("[blue]Starting summarize command...[/blue]")
 
+    # Check if a single directory path was provided
+    if input_files and len(input_files) == 1 and os.path.isdir(input_files[0]):
+        directory = Path(input_files[0])
+        mode = detect_processing_mode(directory)
+        
+        if mode == 'pdfs':
+            console.print(f"[blue]Found PDFs in subdirectories of {directory}. Processing recursively for text summaries...[/blue]")
+            
+            # Process PDFs recursively
+            results = analyze_pdfs_recursively(directory, output_format="txt")
+            
+            # Summary report
+            console.print("\n[bold]Processing Summary:[/bold]")
+            total_pdfs = sum(r.get('total_files', r.get('pdfs', 0)) for r in results if r['status'] == 'success')
+            successful_dirs = sum(1 for r in results if r['status'] == 'success')
+            failed_dirs = sum(1 for r in results if r['status'] == 'error')
+            
+            console.print(f"  Directories processed: {successful_dirs + failed_dirs}")
+            console.print(f"  Total PDFs analyzed: {total_pdfs}")
+            console.print(f"  Successful summaries: {successful_dirs}")
+            
+            if failed_dirs > 0:
+                console.print(f"  [red]Failed summaries: {failed_dirs}[/red]")
+                
+            # Check for rate limiting issues
+            if any('rate limiting' in r.get('summary', '').lower() for r in results if r.get('status') == 'success'):
+                console.print("\n[yellow]⚠️  Note: Some summaries were affected by API rate limiting.[/yellow]")
+                console.print("[yellow]   You may want to re-run the analysis later when the service is less busy.[/yellow]")
+            
+            # Exit early for PDF processing
+            return
+        else:
+            # Try to process as directory with images
+            os.chdir(directory)
+            input_files = None  # Reset to trigger detection below
+
+    # Detect processing mode if no explicit input files provided
     if input_files is None or len(input_files) == 0:
-        console.print("[blue]No input files provided. Using all PNG, JPG, and JPEG files in the current directory, sorted to match directory listing.[/blue]")
-        all_files = glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg")
-        input_files = sort_by_directory_order(all_files)
+        mode = detect_processing_mode()
+        
+        if mode == 'images':
+            console.print("[blue]Found image files. Processing as screenshots for PDF summary...[/blue]")
+            all_files = glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg")
+            input_files = sort_by_directory_order(all_files)
+            # Continue with existing image processing logic below
+            
+        elif mode == 'pdfs':
+            console.print("[blue]Found PDFs in subdirectories. Processing recursively for text summaries...[/blue]")
+            
+            # Process PDFs recursively
+            results = analyze_pdfs_recursively(Path.cwd(), output_format="txt")
+            
+            # Summary report
+            console.print("\n[bold]Processing Summary:[/bold]")
+            total_pdfs = sum(r.get('total_files', r.get('pdfs', 0)) for r in results if r['status'] == 'success')
+            successful_dirs = sum(1 for r in results if r['status'] == 'success')
+            failed_dirs = sum(1 for r in results if r['status'] == 'error')
+            
+            console.print(f"  Directories processed: {successful_dirs + failed_dirs}")
+            console.print(f"  Total PDFs analyzed: {total_pdfs}")
+            console.print(f"  Successful summaries: {successful_dirs}")
+            
+            if failed_dirs > 0:
+                console.print(f"  [red]Failed summaries: {failed_dirs}[/red]")
+                
+            # Check for rate limiting issues
+            if any('rate limiting' in r.get('summary', '').lower() for r in results if r.get('status') == 'success'):
+                console.print("\n[yellow]⚠️  Note: Some summaries were affected by API rate limiting.[/yellow]")
+                console.print("[yellow]   You may want to re-run the analysis later when the service is less busy.[/yellow]")
+            
+            # Exit early for PDF processing
+            return
+            
+        else:
+            console.print("[red]No processable files found in the current directory or subdirectories.[/red]")
+            raise typer.Exit(1)
 
     # Use default CSS file if no CSS file is provided
     if css_file is None:

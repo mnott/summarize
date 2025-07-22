@@ -1,6 +1,5 @@
 beautifulsoup4
 cssutils
-fitz
 img2pdf
 InquirerPy
 Markdown
@@ -19,3 +18,5 @@ spacy
 torch
 transformers
 typer
+pandas
+openpyxl

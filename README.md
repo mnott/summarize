@@ -3,7 +3,10 @@
 # summarize: Convert Screen Shots into a Readable Text and create a summary; also works with PDFs.
 
 This script provides functionality to convert screenshots and PDFs into a readable text format,
-generate summaries, and create styled PDF outputs.
+generate summaries, and create styled PDF outputs. It can operate in two modes:
+
+1. **Image Mode**: Process PNG/JPG/JPEG screenshots in the current directory
+2. **PDF Mode**: Recursively analyze PDFs in subdirectories with financial summary
 
 # Installation
 
@@ -43,15 +46,58 @@ To get help about the script, call it with the `--help` option:
 ./summarize.py --help
 ```
 
-## Summarize a bunch of images in the current directory
+## Automatic Mode Detection
+
+The script automatically detects which mode to use:
 
 ```bash
 ./summarize.py
 ```
 
-This will take only pgn, jpg, and jpeg files in the current directory and summarize them.
+- If PNG/JPG/JPEG files are found in the current directory → Image mode
+- If PDFs are found in subdirectories → PDF recursive analysis mode
 
-## Summarize some specific files in order
+## Image Mode: Summarize screenshots
+
+```bash
+./summarize.py
+```
+
+This will process PNG, JPG, and JPEG files in the current directory and create a styled PDF summary.
+
+## PDF Mode: Recursive financial analysis
+
+```bash
+./summarize.py
+```
+
+When PDFs are detected in subdirectories, the script will:
+- Recursively scan all subdirectories for PDF files
+- Extract text and amounts from each PDF
+- Generate AI summaries for each directory
+- Create aggregate summaries for parent directories
+- Output three files at the root level:
+  - `summary_TIMESTAMP.json` - Complete analysis data
+  - `summary_TIMESTAMP.xlsx` - Excel workbook with financial summary
+  - `summary_TIMESTAMP.pdf` - Formatted PDF report
+
+### Features:
+- **Multi-currency support**: Automatically detects and tracks any valid ISO currency
+- **Smart amount extraction**: Finds total amounts in receipts across multiple languages
+- **Parallel processing**: Uses multiple threads for faster analysis
+- **Rate limit handling**: Gracefully handles API rate limiting
+- **Non-receipt PDFs**: Processes all PDFs, even non-financial documents
+
+### Output Format:
+The Excel summary includes:
+- Directory path
+- Document type (PDFs or Aggregate)
+- Number of documents
+- Processing date
+- Separate columns for each currency found
+- Total row with sums (using SUBTOTAL for filtering support)
+
+## Summarize specific files
 
 ```bash
 ./summarize.py file1.png file2.pdf
@@ -73,6 +119,125 @@ This script is released under the [WTFPL License](https://en.wikipedia.org/wiki/
 
 A context manager for suppressing stdout and stderr output.
 
+## find_pdfs_recursively
+
+Find all PDF files recursively in a directory and group them by parent directory.
+Excludes generated summary PDFs to avoid double processing.
+
+Args:
+    directory: Root directory to search
+    
+Returns:
+    Dictionary mapping directory paths to lists of PDF files in that directory
+
+## extract_text_from_pdf_simple
+
+Extract all text from a PDF file (without OCR - assumes text is already embedded).
+
+Args:
+    pdf_path: Path to the PDF file
+    
+Returns:
+    Dictionary containing extracted text and metadata
+
+## extract_amounts_from_text
+
+Extract monetary amounts and their currencies from text.
+Focus on total amounts in summaries.
+
+Returns:
+    List of (amount, currency) tuples
+
+## create_pdf_summary
+
+Create a summary of extracted PDF texts using AI.
+
+Args:
+    texts: List of extracted text dictionaries
+    directory: Directory being processed
+    
+Returns:
+    Summary text
+
+## process_pdf_directory
+
+Process all PDFs in a directory and create a summary file.
+
+Args:
+    directory: Directory to process
+    output_format: Output format ('txt' or 'json')
+    show_progress: Whether to show progress messages
+    
+Returns:
+    Processing results
+
+## create_aggregate_summary
+
+Create an aggregate summary for a parent directory based on subdirectory results.
+Returns both the summary text and structured data.
+
+## cleanup_intermediate_files
+
+Remove all intermediate summary files recursively, optionally keeping root files.
+
+Args:
+    directory: Root directory
+    timestamp: Run timestamp to identify files from this run
+    keep_root: If True, keep files in the root directory
+
+## create_master_json
+
+Create a master JSON file with all data from the analysis.
+
+Args:
+    directory: Root directory for the analysis
+    all_data: Complete in-memory data structure
+    timestamp: Run timestamp
+    
+Returns:
+    Path to the created master JSON file
+
+## create_summary_pdf_from_data
+
+Create a styled PDF summary from the analysis data.
+
+Args:
+    all_data: Complete in-memory data structure
+    output_path: Path for the output PDF
+    css_file: Optional CSS file for styling
+
+## create_excel_summary
+
+Create an Excel file with structured summary data.
+
+Args:
+    directory: Root directory for the analysis
+    all_data: Complete in-memory data structure
+    timestamp: Run timestamp
+    
+Returns:
+    Path to the created Excel file
+
+## display_summary_table
+
+Display a rich table with summary data in the console.
+
+Args:
+    all_data: Complete in-memory data structure
+
+## analyze_pdfs_recursively
+
+Recursively analyze PDFs in directories and create hierarchical summaries.
+
+## detect_processing_mode
+
+Detect whether to use image processing or PDF recursive processing.
+
+Returns:
+    'images' for image processing (PNG/JPG/JPEG in current dir)
+    'pdfs' for recursive PDF processing (PDFs in subdirectories)
+    'none' if no processable files found
+
 ## sort_by_directory_order
 
 Sort files to match the exact order shown in the directory listing.
@@ -93,25 +258,6 @@ Args:
 
 Returns:
     PIL.Image.Image: Cropped image with padding.
-
-## convert_images_to_pdf
-
-Convert a list of images to a single PDF file with proportional padding and maintained quality.
-
-Args:
-    image_paths (List): List of image file paths.
-    output_path (str): Path to save the output PDF.
-    padding_ratio (float): Ratio of padding to add around the cropped area of each image relative to the page width. Default is 0.05 (5% of the page width).
-
-## apply_ocr
-
-Apply Optical Character Recognition (OCR) to a PDF file.
-
-Args:
-    pdf_path (str): Path to the input PDF file.
-
-Returns:
-    str: Extracted text from the PDF.
 
 ## are_images_similar
 
@@ -142,7 +288,7 @@ Returns:
 Process a single image file.
 
 Args:
-    args (tuple): Tuple containing (png_file, temp_dir, i).
+    args (tuple): Tuple containing (png_file, temp_dir, i, use_original_resolution).
 
 Returns:
     tuple: (pdf_path, extracted_text)
@@ -210,10 +356,11 @@ Args:
 
 ## summarize
 
-Generate a summary PDF from input files (PDFs or images).
+Generate a summary from input files (PDFs or images).
 
-This command processes input files (PDFs and images), extracts text, generates a summary,
-and creates a styled PDF output with the summary and original content.
+This command automatically detects the type of processing needed:
+- If PNG/JPG/JPEG files are found in the current directory: Creates a styled PDF summary
+- If PDFs are found in subdirectories: Creates recursive text summaries with totals
 
 ## config
 
