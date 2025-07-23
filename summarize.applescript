@@ -1,32 +1,40 @@
-on run {input, parameters}
+on run
+	-- Handle both direct execution and Automator-style execution
+	try
+		set input to input
+		set parameters to parameters
+	on error
+		set input to {}
+		set parameters to {}
+	end try
 	set summaryCommand to "summarize"
-
-	tell application "Path Finder" to activate
+	
+	tell application "Path�Finder" to activate
 	delay 0.5 -- Give Path Finder time to become active
-
+	
 	tell application "System Events"
 		tell process "Path Finder"
 			click menu item "Unix" of menu 1 of menu item "Copy Path" of menu 1 of menu bar item "Edit" of menu bar 1
 		end tell
 	end tell
-
+	
 	delay 0.2
-
+	
 	-- Get the copied path from the clipboard
 	set fullPath to (the clipboard as text)
-
+	
 	if fullPath starts with "file://" then
 		set fullPath to text 7 thru -1 of fullPath
 	end if
-
+	
 	if fullPath is "" then
 		display dialog "Unable to get the current path from Path Finder." buttons {"OK"} default button "OK"
 		return
 	end if
-
+	
 	-- Check if the path ends with a file extension
-	set isFile to fullPath contains "." and (offset of "." in (reverse of characters of fullPath as string)) ≤ 5
-
+	set isFile to fullPath contains "." and (offset of "." in (reverse of characters of fullPath as string)) <= 5
+	
 	-- Set the directory path
 	if isFile then
 		-- Extract only the directory path
@@ -38,9 +46,12 @@ on run {input, parameters}
 		-- Use the full path as it's already a directory
 		set directoryPath to fullPath
 	end if
-
-	tell application "Terminal"
+	
+	tell application "iTerm"
 		activate
-		do script "cd " & quoted form of directoryPath & " && " & summaryCommand & " && exit"
+		create window with default profile
+		tell current session of current window
+			write text "cd " & quoted form of directoryPath & " && " & summaryCommand & " && exit"
+		end tell
 	end tell
 end run

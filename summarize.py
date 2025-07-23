@@ -169,6 +169,8 @@ from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, PageBreak, Table, TableStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from rich import print
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
@@ -460,13 +462,15 @@ def extract_amounts_from_text(text: str) -> List[Tuple[float, str]]:
     return amounts
 
 
-def create_pdf_summary(texts: List[Dict], directory: Path) -> str:
+def create_pdf_summary(texts: List[Dict], directory: Path, language: str = "english", additional_prompt: str = None) -> str:
     """
     Create a summary of extracted PDF texts using AI.
     
     Args:
         texts: List of extracted text dictionaries
         directory: Directory being processed
+        language: Output language for the summary
+        additional_prompt: Additional instructions or context for the AI
         
     Returns:
         Summary text
@@ -486,9 +490,10 @@ def create_pdf_summary(texts: List[Dict], directory: Path) -> str:
     # Use AI to generate summary
     ai_client = AIClient(config_provider=GitConfig())
     
-    prompt = f"""
+    # Build the base prompt
+    base_prompt = f"""
     Analyze the following receipt/document texts extracted from PDF files in {directory.name}.
-    Create a structured summary that includes:
+    Create a structured summary IN {language.upper()} that includes:
     
     1. Overview of all documents found
     2. For receipts: extract key information like:
@@ -501,6 +506,7 @@ def create_pdf_summary(texts: List[Dict], directory: Path) -> str:
     4. Any patterns or notable observations
     
     IMPORTANT: 
+    - The entire response must be written in {language}.
     - The receipts may be in multiple languages (English, French, German, Italian).
     - Look for amount indicators like: Total, Montant, Betrag, Importo, Summe, Somme, CHF, EUR, USD
     - ALWAYS include a clear total line at the end in this format: "Total: CHF 123.45" (or EUR, USD, etc.)
@@ -508,12 +514,14 @@ def create_pdf_summary(texts: List[Dict], directory: Path) -> str:
       Total: CHF 100.00
       Total: EUR 50.00
     
-    Format the output as a clear, structured text that can be used for later analysis.
+    Format the output as a clear, structured text that can be used for later analysis."""
     
-    Documents to analyze:
+    # Add additional prompt if provided
+    if additional_prompt:
+        base_prompt += f"\n\nAdditional instructions: {additional_prompt}"
     
-    {combined_text}
-    """
+    # Add the documents to analyze
+    prompt = base_prompt + f"\n\nDocuments to analyze:\n\n{combined_text}"
     
     try:
         response = ai_client.prompt(prompt, tokens=1500)
@@ -537,7 +545,7 @@ def create_pdf_summary(texts: List[Dict], directory: Path) -> str:
             return f"Error generating summary: {e}"
 
 
-def process_pdf_directory(directory: Path, show_progress: bool = True) -> Dict:
+def process_pdf_directory(directory: Path, show_progress: bool = True, language: str = "english", additional_prompt: str = None) -> Dict:
     """
     Process all PDFs in a directory and create a summary file.
     
@@ -545,6 +553,7 @@ def process_pdf_directory(directory: Path, show_progress: bool = True) -> Dict:
         directory: Directory to process
         output_format: Output format ('txt' or 'json')
         show_progress: Whether to show progress messages
+        language: Output language for summaries
         
     Returns:
         Processing results
@@ -566,7 +575,7 @@ def process_pdf_directory(directory: Path, show_progress: bool = True) -> Dict:
         extracted_texts.append(extracted)
     
     # Create summary
-    summary = create_pdf_summary(extracted_texts, directory)
+    summary = create_pdf_summary(extracted_texts, directory, language, additional_prompt)
     
     # Extract amounts from the summary for structured data
     summary_amounts = extract_amounts_from_text(summary)
@@ -606,7 +615,7 @@ def process_pdf_directory(directory: Path, show_progress: bool = True) -> Dict:
     }
 
 
-def create_aggregate_summary(directory: Path, subdirectory_results: List[Dict]) -> Dict:
+def create_aggregate_summary(directory: Path, subdirectory_results: List[Dict], language: str = "english", additional_prompt: str = None) -> Dict:
     """
     Create an aggregate summary for a parent directory based on subdirectory results.
     Returns both the summary text and structured data.
@@ -643,8 +652,9 @@ def create_aggregate_summary(directory: Path, subdirectory_results: List[Dict]) 
     # Generate AI summary
     ai_client = AIClient(config_provider=GitConfig())
     
-    prompt = f"""
-    Create an aggregate summary for the directory '{directory.name}' which contains the following subdirectories with receipts/documents:
+    # Build the base prompt
+    base_prompt = f"""
+    Create an aggregate summary IN {language.upper()} for the directory '{directory.name}' which contains the following subdirectories with receipts/documents:
     
     Subdirectories analyzed: {', '.join(subdirs_with_pdfs)}
     Total documents found: {total_receipts}
@@ -658,7 +668,13 @@ def create_aggregate_summary(directory: Path, subdirectory_results: List[Dict]) 
     3. Notes any patterns or interesting observations across the subdirectories
     
     Keep it brief and focused on the financial overview.
-    """
+    IMPORTANT: The entire response must be written in {language}."""
+    
+    # Add additional prompt if provided
+    if additional_prompt:
+        base_prompt += f"\n\nAdditional instructions: {additional_prompt}"
+    
+    prompt = base_prompt
     
     try:
         response = ai_client.prompt(prompt, tokens=800)
@@ -1093,7 +1109,7 @@ def display_summary_table(all_data: Dict):
     console.print(table)
 
 
-def analyze_pdfs_recursively(directory: Path, output_format: str = "txt", cleanup: bool = True, max_workers: int = 4) -> List[Dict]:
+def analyze_pdfs_recursively(directory: Path, output_format: str = "txt", cleanup: bool = True, max_workers: int = 4, language: str = "english", additional_prompt: str = None) -> List[Dict]:
     """
     Recursively analyze PDFs in directories and create hierarchical summaries.
     """
@@ -1132,7 +1148,7 @@ def analyze_pdfs_recursively(directory: Path, output_format: str = "txt", cleanu
             # Submit all tasks
             future_to_dir = {}
             for dir_path, pdf_files in pdf_map.items():
-                future = executor.submit(process_pdf_directory, dir_path, False)
+                future = executor.submit(process_pdf_directory, dir_path, False, language, additional_prompt)
                 future_to_dir[future] = (dir_path, pdf_files)
             
             # Process results as they complete
@@ -1214,7 +1230,7 @@ def analyze_pdfs_recursively(directory: Path, output_format: str = "txt", cleanu
                         child_results.append(aggregated_data[child])
                 
                 if child_results:
-                    aggregate_data = create_aggregate_summary(directory / dir_path, child_results)
+                    aggregate_data = create_aggregate_summary(directory / dir_path, child_results, language, additional_prompt)
                     aggregated_data[rel_path] = {
                         'directory': str(directory / dir_path),
                         'processed_date': datetime.now().isoformat(),
@@ -1615,13 +1631,15 @@ def extract_text_from_pdf(pdf_path):
     return text
 
 
-def generate_summary(text, max_tokens=1000):
+def generate_summary(text, max_tokens=1000, language="english", additional_prompt=None):
     """
     Generate a summary of the given text using an AI model.
 
     Args:
         text (str): Input text to summarize.
         max_tokens (int): Maximum number of tokens for the summary.
+        language (str): Output language for the summary.
+        additional_prompt (str): Additional instructions or context for the AI.
 
     Returns:
         str: Generated summary.
@@ -1629,11 +1647,12 @@ def generate_summary(text, max_tokens=1000):
     text = clean_text(text)
 
     ai_client = AIClient(config_provider=GitConfig())
-    console.print(f"[blue]Using {ai_client.name} to generate a summary...[/blue]")
-    prompt = f"""
-    Please provide a concise summary of the following text, followed by a bulleted list
+    console.print(f"[blue]Using {ai_client.name} to generate a summary in {language.title()}...[/blue]")
+    # Build the base prompt
+    base_prompt = f"""
+    Please provide a concise summary of the following text IN {language.upper()}, followed by a bulleted list
     of the main topics and their explanations. Format the output exactly as follows,
-    using markdown formatting:
+    using markdown formatting. IMPORTANT: The entire response must be in {language}:
 
     # Summary:
     [Your concise summary here]
@@ -1668,12 +1687,14 @@ def generate_summary(text, max_tokens=1000):
     screenshots, you do not need to describe that interface. You can assume the
     reader knows what it looks like. I absolutely do not want you to give a
     description of the teams interface. so no "Meeting controls (e.g., Leave, Take control, Chat, Raise hand)"
-    etc. Just focus on the content of the document.
-
-    Here's the text to summarize:
-
-    {text}
-    """
+    etc. Just focus on the content of the document."""
+    
+    # Add additional prompt if provided
+    if additional_prompt:
+        base_prompt += f"\n\nAdditional instructions: {additional_prompt}"
+    
+    # Add the text to summarize
+    prompt = base_prompt + f"\n\nHere's the text to summarize:\n\n{text}"
 
     try:
         response = ai_client.prompt(prompt, tokens=max_tokens)
@@ -1756,6 +1777,49 @@ def create_summary_pdf(summary, output_path, css_path):
     if not summary:
         raise ValueError("Summary content is empty")
 
+    # Register Unicode fonts
+    try:
+        # Try to use system fonts that support Unicode
+        import platform
+        system = platform.system()
+        
+        if system == "Darwin":  # macOS
+            # Try Arial Unicode MS first (best Unicode support)
+            font_paths = [
+                "/Library/Fonts/Arial Unicode.ttf",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Microsoft/Arial.ttf",
+            ]
+        elif system == "Windows":
+            font_paths = [
+                "C:/Windows/Fonts/arial.ttf",
+                "C:/Windows/Fonts/ArialUni.ttf",
+            ]
+        else:  # Linux
+            font_paths = [
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+        
+        # Try to register a Unicode font
+        font_registered = False
+        for font_path in font_paths:
+            if os.path.exists(font_path):
+                try:
+                    pdfmetrics.registerFont(TTFont('UnicodeFont', font_path))
+                    font_registered = True
+                    console.print(f"[green]Registered Unicode font: {font_path}[/green]")
+                    break
+                except Exception as e:
+                    console.print(f"[yellow]Failed to register font {font_path}: {e}[/yellow]")
+        
+        if not font_registered:
+            console.print("[yellow]Warning: Could not register Unicode font. Polish characters may not display correctly.[/yellow]")
+    except Exception as e:
+        console.print(f"[yellow]Warning: Font registration error: {e}[/yellow]")
+
     doc = SimpleDocTemplate(output_path, pagesize=A4, rightMargin=inch, leftMargin=inch, topMargin=inch, bottomMargin=inch)
 
     # Get sample stylesheet as a fallback
@@ -1774,9 +1838,16 @@ def create_summary_pdf(summary, output_path, css_path):
 
             # Use sample style as a base, then override with CSS values
             base_style = sample_styles['BodyText']
+            
+            # Check if Unicode font was registered
+            fontName = base_style.fontName
+            if 'UnicodeFont' in pdfmetrics.getRegisteredFontNames():
+                fontName = 'UnicodeFont'
+            
             new_style = ParagraphStyle(
                 selector,
                 parent=base_style,
+                fontName       = fontName,
                 fontSize       = parse_css_value(style_dict.get('font-size'),     base_style.fontSize),
                 leading        = parse_css_value(style_dict.get('line-height'),   base_style.leading),
                 spaceBefore    = parse_css_value(style_dict.get('margin-top'),    base_style.spaceBefore),
@@ -1833,11 +1904,17 @@ def create_summary_pdf(summary, output_path, css_path):
 
             # Create a table for both heading1 and heading2 with background color and border
             t = Table([[text]], colWidths=[available_width])
+            
+            # Use Unicode font if available
+            table_font = style.fontName
+            if 'UnicodeFont' in pdfmetrics.getRegisteredFontNames():
+                table_font = 'UnicodeFont'
+            
             t.setStyle(TableStyle([
                 ('BACKGROUND', (0,0), (-1,-1), style.backColor),
                 ('TEXTCOLOR', (0,0), (-1,-1), style.textColor),
                 ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-                ('FONTNAME', (0,0), (-1,-1), style.fontName),
+                ('FONTNAME', (0,0), (-1,-1), table_font),
                 ('FONTSIZE', (0,0), (-1,-1), style.fontSize),
                 ('BOTTOMPADDING', (0,0), (-1,-1), parse_css_value(style_dict.get('padding-bottom', '5'), 5)),
                 ('TOPPADDING', (0,0), (-1,-1), parse_css_value(style_dict.get('padding-top', '5'), 5)),
@@ -1870,6 +1947,8 @@ def summarize(
     max_tokens:             int = typer.Option(1000,          "-m", "--max-tokens",  help="Maximum number of tokens for summary generation", show_default=True),
     similarity_threshold: float = typer.Option(0.95,          "-s", "--similarity",  help="Threshold for image similarity (0-1). Use 1 for no similarity check.", show_default=True),
     no_ai:                 bool = typer.Option(False,         "-n", "--no-ai",       help="Skip AI recognition and summary generation"),
+    language:               str = typer.Option("english",      "-l", "--language",    help="Output language for summaries (e.g., english, polish, german, french)", show_default=True),
+    additional_prompt:      str = typer.Option(None,           "-p", "--prompt",      help="Additional instructions or context for the AI to focus on during summarization"),
 ):
     """
     Generate a summary from input files (PDFs or images).
@@ -1889,7 +1968,7 @@ def summarize(
             console.print(f"[blue]Found PDFs in subdirectories of {directory}. Processing recursively for text summaries...[/blue]")
             
             # Process PDFs recursively
-            results = analyze_pdfs_recursively(directory, output_format="txt")
+            results = analyze_pdfs_recursively(directory, output_format="txt", language=language, additional_prompt=additional_prompt)
             
             # Summary report
             console.print("\n[bold]Processing Summary:[/bold]")
@@ -1930,7 +2009,7 @@ def summarize(
             console.print("[blue]Found PDFs in subdirectories. Processing recursively for text summaries...[/blue]")
             
             # Process PDFs recursively
-            results = analyze_pdfs_recursively(Path.cwd(), output_format="txt")
+            results = analyze_pdfs_recursively(Path.cwd(), output_format="txt", language=language, additional_prompt=additional_prompt)
             
             # Summary report
             console.print("\n[bold]Processing Summary:[/bold]")
@@ -2050,7 +2129,7 @@ def summarize(
         final_output_path = os.path.abspath(final_output_filename)
 
         if not no_ai:
-            summary = generate_summary(all_text, max_tokens)
+            summary = generate_summary(all_text, max_tokens, language, additional_prompt)
 
             if summary is None:
                 console.print("[red]Failed to generate summary. Please check your AI configuration and try again.[/red]")
